@@ -1,4 +1,4 @@
-# Cortex XSIAM/XSOAR Custom Scripts
+# Cortex Cloud Custom Scripts
 
 This repository contains custom automation scripts for Cortex Cloud. These scripts work together to filter AWS accounts by name pattern and create dynamic asset groups based on the results.
 
