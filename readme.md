@@ -1,6 +1,6 @@
 # Cortex Cloud Custom Scripts
 
-This repository contains custom automation scripts for Cortex Cloud. These scripts work together to filter AWS accounts by name pattern and create dynamic asset groups based on the results.
+This repository contains custom automation scripts for Cortex Cloud. These scripts work together to filter cloud accounts by name pattern and create dynamic asset groups based on the results. Works with any cloud provider (AWS, Azure, GCP).
 
 
 ---
@@ -15,37 +15,51 @@ This repository contains custom automation scripts for Cortex Cloud. These scrip
 
 ---
 
-## Script 1: GetAWSRealms
+## Script 1: GetCloudAccounts
 
-Executes an XQL query against the asset inventory to retrieve AWS account realm IDs (account IDs) filtered by account name pattern.
+Retrieves cloud account IDs filtered by account name using the Cloud Onboarding APIs. Works with any cloud provider (AWS, Azure, GCP) based on the integration instance.
 
 ### Script Settings
 
 | Field | Value |
 |-------|-------|
-| **Name** | `GetAWSRealms` |
-| **Description** | Executes XQL query against asset_inventory to extract xdm.asset.realm values for AWS accounts filtered by name. |
+| **Name** | `GetCloudAccounts` |
+| **Description** | Retrieves cloud account IDs filtered by account name using Cloud Onboarding APIs. Works with any cloud provider. |
 
 ### Input Arguments
 
 | Argument | Type | Required | Default | Description |
 |----------|------|----------|---------|-------------|
-| `filter_keyword` | String | Yes | `SOC` | Keyword to filter AWS account names (e.g., "SOC", "Production") |
+| `instance_ids` | Array | Yes | — | One or more cloud integration instance IDs (also known as Connector ID in Cortex Cloud) |
+| `filter_keyword` | String | No | — | Filter expression with optional flag prefix (see below) |
+| `case_sensitive` | Boolean | No | `false` | Enable case-sensitive matching |
+| `debug` | Boolean | No | `false` | Show debug info in output |
 
-> **Tip:** Check the "Mandatory" checkbox to prevent execution without this argument. You can also set a default value if it applies to your use case.
+> **Important:** For the `instance_ids` argument, enable the **"Is array"** checkbox in the script configuration to accept multiple values.
+
+### Filter Syntax
+
+| Flag | Example | Description |
+|------|---------|-------------|
+| (none) | `SOC` | Simple contains match |
+| `-r` | `-r ^AWS-SOC.*` | Regex pattern match |
+| `-or` | `-or SOC, PROD, DEV` | Match ANY keyword (comma-separated) |
+| `-and` | `-and SOC, Production` | Match ALL keywords (comma-separated) |
 
 ### Output
 
 | Context Path | Type | Description |
 |--------------|------|-------------|
-| `GetAWSRealms.values` | List | List of AWS realm IDs (account IDs) matching the filter |
-| `GetAWSRealms.status` | String | Query execution status (SUCCESS/PENDING/FAILED) |
-| `GetAWSRealms.results_count` | Number | Count of realms found |
-| `GetAWSRealms.filter_keyword` | String | The filter keyword used |
+| `GetCloudAccounts.values` | List | List of cloud account IDs matching the filter |
+| `GetCloudAccounts.account_names` | List | List of account names matching the filter |
+| `GetCloudAccounts.results_count` | Number | Count of accounts found |
+| `GetCloudAccounts.instance_ids` | List | The instance IDs queried |
+| `GetCloudAccounts.filter_keyword` | String | The filter expression used |
+| `GetCloudAccounts.case_sensitive` | Boolean | Whether case-sensitive matching was used |
 
 ### Configuration Screenshot Reference
 
-![Script Configuration](images/getawsrealms-config.png)
+![Script Configuration](images/getcloudaccounts-config.png)
 
 ---
 
@@ -93,45 +107,46 @@ Creates or updates a dynamic asset group in Cortex XSIAM based on a list of real
 
 These scripts are designed to work together. A typical workflow:
 
-1. **Run GetAWSRealms** with a filter keyword (e.g., "SOC") to get the list of AWS account realm IDs
-2. **Run CreateAssetGroup** using the realm list from step 1 to create/update a dynamic asset group
+1. **Run GetCloudAccounts** with an instance ID and filter to get the list of cloud account IDs
+2. **Run CreateAssetGroup** using the account list from step 1 to create/update a dynamic asset group
 
 ### Example Playbook Flow
 
 ```
-┌─────────────────────────────────────┐
-│         GetAWSRealms                │
-│   filter_keyword: "SOC"             │
-│   Output: GetAWSRealms.values       │
-└──────────────────┬──────────────────┘
-                   │
-                   ▼
-┌─────────────────────────────────────┐
-│       CreateAssetGroup              │
-│   group_name: "SOC AWS Accounts"    │
-│   realm_list: ${GetAWSRealms.values}│
-│   dry_run: false                    │
-└─────────────────────────────────────┘
+┌───────────────────────────────────────────┐
+│           GetCloudAccounts                │
+│   instance_ids: ["aws-inst", "gcp-inst"]  │
+│   filter_keyword: "-or SOC; PROD"         │
+│   Output: GetCloudAccounts.values         │
+└────────────────────┬──────────────────────┘
+                     │
+                     ▼
+┌───────────────────────────────────────────┐
+│         CreateAssetGroup                  │
+│   group_name: "SOC Cloud Accounts"        │
+│   realm_list: ${GetCloudAccounts.values}  │
+│   dry_run: false                          │
+└───────────────────────────────────────────┘
 ```
 
 ---
 
 ## Troubleshooting
 
-### GetAWSRealms returns no results
-- Verify the XQL query works directly in Cortex XQL console
+### GetCloudAccounts returns no results
+- Run with `debug="true"` to see detailed API response info
+- Verify the instance_id is correct and the integration is active
 - Check that the filter_keyword matches actual account names
-- Ensure the XDR - XQL Query Engine integration is properly configured
+- If using regex (`-r`), verify the pattern is valid
 
 ### CreateAssetGroup fails with API errors
 - Verify you have permissions to create/modify asset groups
 - Check that the realm_list is not empty
 - Use `dry_run: true` first to preview what would be created
 
-### Query times out (PENDING status)
-- The script has a default timeout of 120 seconds
-- For large datasets, the query may take longer
-- Try running the query directly in the XQL console to estimate execution time
+### API returns fewer accounts than expected
+- The script automatically handles pagination to fetch all accounts
+- Run with `debug="true"` to see pagination details
 
 ---
 
@@ -139,6 +154,7 @@ These scripts are designed to work together. A typical workflow:
 
 | File | Description |
 |------|-------------|
-| `GetAWSRealms.py` | Script to retrieve AWS realm IDs filtered by account name |
+| `GetCloudAccounts.py` | Script to retrieve cloud account IDs filtered by account name |
 | `CreateAssetGroup.py` | Script to create/update dynamic asset groups |
 | `cortex-apis-docs.md` | Reference documentation for Cortex platform APIs |
+| `cortex-cloud-onboarding-apis-docs.md` | Reference documentation for Cloud Onboarding APIs |
