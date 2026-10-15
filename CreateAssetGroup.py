@@ -32,23 +32,6 @@ import json
 
 
 # =============================================================================
-# TEST INPUTS - TEMPORARY, remove this section (and its use in main) after testing
-# =============================================================================
-# When USE_TEST_ARGS is True, these values replace the script arguments.
-# Run twice: the 1st run should create the group, the 2nd should update it.
-
-USE_TEST_ARGS = True
-
-TEST_ARGS = {
-    "group_name": "TEST - CreateAssetGroup script",
-    "account_ids": ["279251427966"],
-    "group_description": "Test group created by CreateAssetGroup script",
-    "dry_run": "false",
-    "debug": "true",
-}
-
-
-# =============================================================================
 # CONSTANTS
 # =============================================================================
 
@@ -346,7 +329,7 @@ def main():
     mode for previewing changes.
     """
     try:
-        args = TEST_ARGS if USE_TEST_ARGS else demisto.args()  # TEMPORARY - see TEST INPUTS
+        args = demisto.args()
 
         # Parse and validate arguments
         group_name = args.get("group_name")
