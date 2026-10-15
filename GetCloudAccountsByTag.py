@@ -22,13 +22,17 @@ NOTE: demisto.executeCommand is called concurrently from multiple threads here.
 If that proves unreliable in your Cortex tenant/engine, set max_workers=1 to
 fall back to sequential calls.
 
-This script always scans AWS Account, Azure Subscription and GCP Project assets
-(see ASSET_TYPES below) - it is not configurable from the Cortex UI, by design.
+By default this script scans AWS Account, Azure Subscription and GCP Project
+assets (see ASSET_TYPE_BY_PROVIDER below); the cloud_provider argument narrows
+that down to one or more providers. The asset type names themselves are not
+configurable from the Cortex UI, by design.
 
 Arguments:
     tag_key (str): Required. Tag key to look for.
     tag_value (list): Optional. Comma-separated tag values. When set, the tag must
         have one of these values; when empty, any account with the key matches.
+    cloud_provider (list): Optional. Comma-separated cloud providers to scan
+        (AWS, Azure, GCP - case-insensitive). When empty, all providers are scanned.
     case_sensitive (bool): Optional. Default: false.
     max_workers (int): Optional. Parallel threads for AWS raw_fields lookups.
         Default: 10. Set to 1 for sequential (safest) execution.
@@ -54,8 +58,14 @@ import traceback
 API_GET_ASSETS = "/public_api/v1/assets"
 API_GET_RAW_FIELDS = "/public_api/v1/assets/{asset_id}/raw_fields"
 
-# Fixed scope for this script - not exposed as a Cortex argument on purpose.
-ASSET_TYPES = ["AWS Account", "Azure Subscription", "GCP Project"]
+# Asset type scanned per cloud provider. Keys are the (lowercase) values accepted
+# by the cloud_provider argument; the asset type names are not exposed on purpose.
+ASSET_TYPE_BY_PROVIDER = {
+    "aws": "AWS Account",
+    "azure": "Azure Subscription",
+    "gcp": "GCP Project",
+}
+ASSET_TYPES = list(ASSET_TYPE_BY_PROVIDER.values())
 
 ASSET_TYPE_FIELD = "xdm.asset.type.name"
 ASSET_ID_FIELD = "xdm.asset.id"
@@ -64,21 +74,24 @@ ASSET_NAME_FIELD = "xdm.asset.name"
 TAGS_FIELD = "xdm.asset.tags"
 RAW_FIELDS_FIELD = "xdm.asset.raw_fields"
 
-# Where to read tags from, per asset type. Anything not listed here falls back to
-# DEFAULT_TAG_SOURCE (tags inline in xdm.asset.tags), which is how Azure reports
-# them today.
+# Where to read tags from, per asset type. Every type in ASSET_TYPE_BY_PROVIDER is
+# listed explicitly; DEFAULT_TAG_SOURCE (tags inline in xdm.asset.tags) is only a
+# fallback for a type added there without a matching entry here.
 TAG_SOURCE_BY_TYPE = {
     "AWS Account": {
         "source": "raw_fields",
         "category": "Platform Discovery",
         "tags_key": "Tags",
     },
+    "Azure Subscription": {
+        "source": "inline",
+        "field": TAGS_FIELD,
+    },
     "GCP Project": {
         "source": "raw_fields",
         "category": "Platform Discovery",
         "tags_key": "labels",
     },
-    # "Azure Subscription": {"source": "inline", "field": "xdm.asset.tags"},
 }
 DEFAULT_TAG_SOURCE = {"source": "inline", "field": TAGS_FIELD}
 
@@ -122,6 +135,32 @@ def parse_api_response(result: list, operation: str) -> dict:
 # ============================================================================
 # ASSET LISTING (paginated)
 # ============================================================================
+
+def resolve_asset_types(cloud_providers: list) -> list:
+    """Map the cloud_provider argument (case-insensitive) to asset types.
+
+    An empty list means every provider. Unknown providers raise a ValueError
+    rather than being silently ignored, so a typo can't shrink the scan.
+    """
+    if not cloud_providers:
+        return ASSET_TYPES
+
+    asset_types = []
+    unknown = []
+    for provider in cloud_providers:
+        asset_type = ASSET_TYPE_BY_PROVIDER.get(provider.lower())
+        if asset_type is None:
+            unknown.append(provider)
+        elif asset_type not in asset_types:
+            asset_types.append(asset_type)
+
+    if unknown:
+        raise ValueError(
+            f"Unknown cloud_provider: {', '.join(unknown)}. "
+            f"Valid values (case-insensitive): {', '.join(ASSET_TYPE_BY_PROVIDER)}"
+        )
+    return asset_types
+
 
 def build_filters(asset_types: list) -> dict:
     """Build filters: type == A OR type == B ..."""
@@ -418,6 +457,7 @@ def main():
         args = demisto.args()
         tag_key = (args.get("tag_key") or "").strip()
         tag_values = [v.strip() for v in argToList(args.get("tag_value")) if v.strip()]
+        cloud_providers = [p.strip() for p in argToList(args.get("cloud_provider")) if p.strip()]
         case_sensitive = argToBoolean(args.get("case_sensitive", "false"))
         debug_mode = argToBoolean(args.get("debug", "false"))
 
@@ -430,12 +470,16 @@ def main():
         if not tag_key:
             raise ValueError("tag_key is required")
 
+        asset_types = resolve_asset_types(cloud_providers)
+
         debug_info = [
             f"Arguments - tag_key: {tag_key}, tag_value: {tag_values}, "
-            f"case_sensitive: {case_sensitive}, max_workers: {max_workers}"
+            f"cloud_provider: {cloud_providers}, case_sensitive: {case_sensitive}, "
+            f"max_workers: {max_workers}",
+            f"Asset types scanned: {asset_types}",
         ]
 
-        assets = get_account_assets(ASSET_TYPES, debug_info)
+        assets = get_account_assets(asset_types, debug_info)
         debug_info.append(f"Accounts fetched: {len(assets)}")
 
         # Only accounts whose type needs a raw_fields lookup (e.g. AWS) require the
@@ -456,7 +500,7 @@ def main():
         account_ids, account_names = extract_accounts(tagged)
         failed_account_ids = [a.get(ACCOUNT_ID_FIELD) for a, _ in failed_lookups]
 
-        readable = build_output(tag_key, tag_values, case_sensitive, ASSET_TYPES,
+        readable = build_output(tag_key, tag_values, case_sensitive, asset_types,
                                 len(assets), account_ids, account_names,
                                 failed_account_ids, debug_mode)
         if debug_mode:
@@ -468,6 +512,7 @@ def main():
             outputs={
                 "tag_key": tag_key,
                 "tag_value": tag_values,
+                "cloud_provider": cloud_providers,
                 "results_count": len(account_ids),
                 "values": account_ids,
                 "account_names": account_names,

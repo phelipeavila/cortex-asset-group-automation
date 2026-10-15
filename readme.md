@@ -70,7 +70,7 @@ Retrieves cloud account IDs filtered by account name using the Cloud Onboarding 
 
 ## Script 1b: GetCloudAccountsByTag
 
-Retrieves cloud account IDs (AWS Account, Azure Subscription, GCP Project) that carry a specific tag, using the Assets API (`/public_api/v1/assets`). The asset types scanned are fixed (`ASSET_TYPES` in the script) and are not exposed as a Cortex argument.
+Retrieves cloud account IDs (AWS Account, Azure Subscription, GCP Project) that carry a specific tag, using the Assets API (`/public_api/v1/assets`). By default all three providers are scanned; use `cloud_provider` to narrow the scan to one or more of them. The provider → asset type mapping is fixed (`ASSET_TYPE_BY_PROVIDER` in the script).
 
 Tags are **not** all returned the same way by the platform:
 
@@ -95,13 +95,14 @@ The extra per-account calls for AWS/GCP are made in parallel (thread pool) so th
 |----------|------|----------|---------|-------------|
 | `tag_key` | String | Yes | — | Tag key to look for |
 | `tag_value` | Array | No | — | Tag values to match (any of them). If empty, any account with the key matches, regardless of value |
+| `cloud_provider` | Array | No | — | Cloud providers to scan: `AWS`, `Azure`, `GCP` (case-insensitive, comma-separated). If empty, all providers are scanned. Unknown values fail the script |
 | `case_sensitive` | Boolean | No | `false` | Enable case-sensitive matching on key and value |
 | `max_workers` | Number | No | `10` | Parallel threads used for the AWS/GCP `raw_fields` lookups (capped at 25). Set to `1` for sequential calls if concurrent `core-api-get`/`core-api-post` calls prove unreliable in your tenant |
 | `debug` | Boolean | No | `false` | Show debug info (pagination, raw_fields fetch stats, failures) in output |
 
-> **Important:** For the `tag_value` argument, enable the **"Is array"** checkbox in the script configuration to accept multiple values.
+> **Important:** For the `tag_value` and `cloud_provider` arguments, enable the **"Is array"** checkbox in the script configuration to accept multiple values.
 >
-> Asset types (AWS Account, Azure Subscription, GCP Project) are hardcoded in the script (`ASSET_TYPES` constant) and are intentionally not a configurable argument.
+> `case_sensitive` applies only to the tag key/value; `cloud_provider` is always case-insensitive.
 >
 > **Limitation:** because `tag_value` is an array, commas are treated as value separators. A tag whose value literally contains a comma (e.g. `Sales, Marketing`) is read as two separate values and cannot be matched literally.
 
@@ -114,6 +115,7 @@ The extra per-account calls for AWS/GCP are made in parallel (thread pool) so th
 | `GetCloudAccountsByTag.results_count` | Number | Count of accounts found |
 | `GetCloudAccountsByTag.tag_key` | String | The tag key used |
 | `GetCloudAccountsByTag.tag_value` | List | The tag values used |
+| `GetCloudAccountsByTag.cloud_provider` | List | The cloud providers requested (empty = all) |
 | `GetCloudAccountsByTag.failed_lookups` | List | Account IDs whose `raw_fields` call failed — **excluded** from `values`. Review these before trusting the result; a failed account may actually have the tag |
 
 ### A note on `raw_fields` cost and script timeout
@@ -134,27 +136,38 @@ Rough wall-clock estimate, assuming ~0.3s per call:
 
 ## Script 2: CreateAssetGroup
 
-Creates or updates a dynamic asset group in Cortex XSIAM based on a list of realm IDs. If a group with the specified name already exists, it will be updated; otherwise, a new group is created.
+Creates or updates a dynamic asset group in Cortex XSIAM based on a list of cloud account IDs. If a group with the specified name already exists, it will be updated; otherwise, a new group is created.
+
+It uses the platform's native asset group commands instead of direct API calls:
+
+| Step | Command |
+|------|---------|
+| Look up an existing group by name | `getAssetGroup` (`names`) |
+| Create a new group | `createAssetGroup` (`group_name`, `group_type=Dynamic`, `group_description`, `membership_json`) |
+| Update the existing group | `setAssetGroup` (`group_id` + the same arguments) |
+
+The membership filter sent in `membership_json` matches `xdm.asset.realm` against every account in `account_ids` (OR) — for AWS, Azure and GCP account-level assets `xdm.asset.realm` equals the cloud account ID.
 
 ### Script Settings
 
 | Field | Value |
 |-------|-------|
 | **Name** | `CreateAssetGroup` |
-| **Description** | Creates or updates a dynamic asset group based on a list of realm IDs. Supports dry-run mode to preview changes. |
+| **Description** | Creates or updates a dynamic asset group based on a list of cloud account IDs. Supports dry-run mode to preview changes. |
 
 ### Input Arguments
 
 | Argument | Type | Required | Default | Description |
 |----------|------|----------|---------|-------------|
 | `group_name` | String | Yes | — | Name of the asset group to create or update |
-| `realm_list` | String | Yes | — | List of realm IDs (can use output from GetAWSRealms) |
+| `account_ids` | Array | Yes | — | List of cloud account IDs (output of `GetCloudAccounts` or `GetCloudAccountsByTag`) |
 | `group_description` | String | No | *Auto-generated* | Description for the asset group |
 | `dry_run` | Boolean | No | `false` | If true, only shows what would be done without making changes |
+| `debug` | Boolean | No | `false` | Show the arguments and raw results of each command in the output |
 
-> **Important:** For the `realm_list` argument, you must enable the **"Is array"** checkbox in the UI. This allows the script to receive a list of values instead of a single string.
+> **Important:** For the `account_ids` argument, you must enable the **"Is array"** checkbox in the UI. This allows the script to receive a list of values instead of a single string.
 
-> **Tip:** For `realm_list`, you can reference the output from GetAWSRealms using the context path `${GetAWSRealms.values}` when chaining the scripts in a playbook.
+> **Tip:** For `account_ids`, reference `${GetCloudAccounts.values}` or `${GetCloudAccountsByTag.values}` when chaining the scripts in a playbook.
 
 ### Output
 
@@ -163,7 +176,7 @@ Creates or updates a dynamic asset group in Cortex XSIAM based on a list of real
 | `CreateAssetGroup.group_id` | String | The asset group ID |
 | `CreateAssetGroup.group_name` | String | The asset group name |
 | `CreateAssetGroup.action` | String | Action performed (created/updated/would be created/would be updated) |
-| `CreateAssetGroup.realm_count` | Number | Number of realms included in the group |
+| `CreateAssetGroup.account_count` | Number | Number of accounts included in the group |
 | `CreateAssetGroup.status` | String | Execution status (success/dry_run) |
 
 ### Configuration Screenshot Reference
@@ -179,7 +192,7 @@ Both account-selection scripts feed the same `CreateAssetGroup` script; pick whi
 1. **Run GetCloudAccounts or GetCloudAccountsByTag** to get the list of cloud account IDs
 2. **Run CreateAssetGroup** using the account list from step 1 to create/update a dynamic asset group
 
-> Because `xdm.asset.realm` equals `xdm.asset.cloud.account.id` for AWS, Azure and GCP account-level assets, the account IDs returned by either script can be passed straight into `CreateAssetGroup`'s `realm_list`.
+> Because `xdm.asset.realm` equals `xdm.asset.cloud.account.id` for AWS, Azure and GCP account-level assets, the account IDs returned by either script can be passed straight into `CreateAssetGroup`'s `account_ids`.
 
 ### Example Playbook Flow — by name
 
@@ -195,7 +208,7 @@ Both account-selection scripts feed the same `CreateAssetGroup` script; pick whi
 ┌───────────────────────────────────────────┐
 │         CreateAssetGroup                  │
 │   group_name: "SOC Cloud Accounts"        │
-│   realm_list: ${GetCloudAccounts.values}  │
+│   account_ids: ${GetCloudAccounts.values} │
 │   dry_run: false                          │
 └───────────────────────────────────────────┘
 ```
@@ -218,12 +231,12 @@ Both account-selection scripts feed the same `CreateAssetGroup` script; pick whi
 ┌───────────────────────────────────────────────┐
 │            CreateAssetGroup                    │
 │   group_name: "Sales Cloud Accounts"          │
-│   realm_list: ${GetCloudAccountsByTag.values} │
+│   account_ids: ${GetCloudAccountsByTag.values} │
 │   dry_run: false                              │
 └─────────────────────────────────────────────────┘
 ```
 
-> **Tip:** `CreateAssetGroup` requires a non-empty `realm_list`. Since a tag might match zero accounts, add a condition on `GetCloudAccountsByTag.results_count > 0` (or check `values` is not empty) before the `CreateAssetGroup` task, so the playbook fails gracefully instead of erroring out.
+> **Tip:** `CreateAssetGroup` requires a non-empty `account_ids`. Since a tag might match zero accounts, add a condition on `GetCloudAccountsByTag.results_count > 0` (or check `values` is not empty) before the `CreateAssetGroup` task, so the playbook fails gracefully instead of erroring out.
 
 ---
 
@@ -237,8 +250,15 @@ Both account-selection scripts feed the same `CreateAssetGroup` script; pick whi
 
 ### CreateAssetGroup fails with API errors
 - Verify you have permissions to create/modify asset groups
-- Check that the realm_list is not empty
+- Check that `account_ids` is not empty
 - Use `dry_run: true` first to preview what would be created
+- Run with `debug: true` to see the raw results of `getAssetGroup` / `createAssetGroup` / `setAssetGroup`
+- If the script fails with the generic *"failed to run script with default configuration"*, the underlying builtin command most likely returned an error that the platform didn't pass through to the script. Run the same command directly in the War Room to see the real reason, e.g.:
+  ```
+  !createAssetGroup group_name="test" group_type="Dynamic" membership_json=`{"AND":[{"OR":[{"SEARCH_FIELD":"xdm.asset.realm","SEARCH_TYPE":"WILDCARD","SEARCH_VALUE":"<account_id>"}]}]}`
+  ```
+- `409 – Maximum number of Asset Groups exceeded` means the tenant hit its asset group limit; no group can be created (by the script, API or UI) until some are removed
+- If it fails with *"Found group ... but could not extract its ID"*, the command returned the ID under a field name the script doesn't know: check the field list in the error and add it to `GROUP_ID_KEYS` in the script
 
 ### API returns fewer accounts than expected
 - The script automatically handles pagination to fetch all accounts
@@ -253,7 +273,7 @@ Both account-selection scripts feed the same `CreateAssetGroup` script; pick whi
 
 ### GetCloudAccountsByTag is slow or times out
 - Every AWS/GCP account requires its own `raw_fields` call; this is the expensive part of the script
-- Narrow `asset_types` to only the provider(s) you need
+- Set `cloud_provider` to only the provider(s) you need — e.g. excluding `AWS`/`GCP` skips their `raw_fields` calls entirely
 - Increase `max_workers` (up to 25) for more parallelism, or lower it to `1` if you suspect concurrent `core-api-get` calls are causing issues in your tenant
 
 ---
@@ -264,6 +284,6 @@ Both account-selection scripts feed the same `CreateAssetGroup` script; pick whi
 |------|-------------|
 | `GetCloudAccounts.py` | Script to retrieve cloud account IDs filtered by account name |
 | `GetCloudAccountsByTag.py` | Script to retrieve cloud account IDs filtered by tag key/value |
-| `CreateAssetGroup.py` | Script to create/update dynamic asset groups |
+| `CreateAssetGroup.py` | Script to create/update dynamic asset groups (via `getAssetGroup` / `createAssetGroup` / `setAssetGroup`) |
 | `cortex-apis-docs.md` | Reference documentation for Cortex platform APIs |
 | `cortex-cloud-onboarding-apis-docs.md` | Reference documentation for Cloud Onboarding APIs |

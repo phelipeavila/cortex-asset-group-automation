@@ -1,21 +1,29 @@
 """CreateAssetGroup - Cortex XSIAM/XSOAR Script
 
-Creates or updates a dynamic asset group based on a list of realm IDs.
+Creates or updates a dynamic asset group based on a list of cloud account IDs.
 If an asset group with the same name exists, it will be updated;
 otherwise, a new group will be created.
 
+Uses the platform's native asset group commands (no direct API calls):
+    - getAssetGroup:    look up an existing group by name
+    - createAssetGroup: create a new group
+    - setAssetGroup:    update an existing group (by group_id)
+
 Arguments:
     group_name (str): Required. Name for the asset group.
-    realm_list (list): Required. Comma-separated list of realm IDs.
+    account_ids (list): Required. Comma-separated list of cloud account IDs
+        (AWS Account, Azure Subscription, GCP Project) - e.g. the output of
+        GetCloudAccounts / GetCloudAccountsByTag.
     group_description (str): Optional. Description for the asset group.
     dry_run (bool): Optional. Preview changes without executing them.
+    debug (bool): Optional. Show the raw command results in output. Default: false.
 
 Output:
     Context path: CreateAssetGroup
         - group_id: The asset group ID
         - group_name: The asset group name
         - action: created/updated/would be created/would be updated
-        - realm_count: Number of realms included
+        - account_count: Number of accounts included
         - status: success/dry_run
 """
 
@@ -24,264 +32,304 @@ import json
 
 
 # =============================================================================
+# TEST INPUTS - TEMPORARY, remove this section (and its use in main) after testing
+# =============================================================================
+# When USE_TEST_ARGS is True, these values replace the script arguments.
+# Run twice: the 1st run should create the group, the 2nd should update it.
+
+USE_TEST_ARGS = True
+
+TEST_ARGS = {
+    "group_name": "TEST - CreateAssetGroup script",
+    "account_ids": ["279251427966"],
+    "group_description": "Test group created by CreateAssetGroup script",
+    "dry_run": "false",
+    "debug": "true",
+}
+
+
+# =============================================================================
 # CONSTANTS
 # =============================================================================
 
-API_GET_GROUPS = "/public_api/v1/asset-groups"
-API_CREATE_GROUP = "/public_api/v1/asset-groups/create"
-API_UPDATE_GROUP = "/public_api/v1/asset-groups/update"
+CMD_GET_GROUP = "getAssetGroup"
+CMD_CREATE_GROUP = "createAssetGroup"
+CMD_UPDATE_GROUP = "setAssetGroup"
 
 DEFAULT_DESCRIPTION = "Dynamic asset group created by automation script"
 GROUP_TYPE = "Dynamic"
-GROUP_ID_FIELD = "XDM.ASSET_GROUP.ID"
+
+# Field names that may hold the group ID / name in the command results, checked
+# case-insensitively and in this order. The commands' exact output shape isn't
+# documented, so both the API-style (XDM.ASSET_GROUP.*) and plain names are tried.
+GROUP_ID_KEYS = ("xdm.asset_group.id", "asset_group_id", "group_id", "id")
+GROUP_NAME_KEYS = ("xdm.asset_group.name", "group_name", "name")
+
+# For the create result, a bare "id" is too generic to trust - if none of these
+# is found, the new group is looked up by name instead.
+CREATED_ID_KEYS = ("xdm.asset_group.id", "asset_group_id", "group_id")
 
 
 # =============================================================================
-# API RESPONSE HANDLING
+# COMMAND EXECUTION
 # =============================================================================
 
-def parse_api_response(result: list, operation: str) -> dict:
+def run_command(command: str, args: dict, debug_info: list) -> list:
     """
-    Parse the response from a core-api-post command.
-    
-    Handles an unusual edge case where the API may return a 401 error entry
-    followed by the actual valid response. This function iterates through
-    all response entries and returns the first valid one.
-    
+    Run a platform command and return its non-error entries.
+
+    The platform may return an error entry (Type 4) ahead of the valid one,
+    so error entries are skipped; the command only fails if nothing else
+    came back.
+
     Args:
-        result: The raw result from demisto.executeCommand()
-        operation: Name of the operation (for error messages)
-    
+        command: Name of the command to execute
+        args: Command arguments
+        debug_info: List that collects debug lines
+
     Returns:
-        The parsed response dictionary containing the 'reply' field
-    
+        The list of non-error result entries
+
     Raises:
-        DemistoException: If no valid response is found
+        DemistoException: If the command returned only error entries
     """
-    if not result:
-        raise DemistoException(f"{operation}: Empty response from API")
-    
-    # Iterate through entries to find a valid response
-    # (API sometimes returns error entries before the actual data)
-    for entry in result:
-        if not isinstance(entry, dict):
-            continue
-        
-        # Skip error entries (Type 4 = error)
-        if entry.get("Type") == 4:
-            continue
-        
-        # Extract response from Contents
-        contents = entry.get("Contents", {})
-        if not isinstance(contents, dict):
-            continue
-            
-        response = contents.get("response", {})
-        if response and "reply" in response:
-            return response
-    
-    # No valid response found - raise error with details
-    error_msg = get_error(result) if is_error(result) else "No valid response found"
-    raise DemistoException(f"{operation}: {error_msg}")
+    result = demisto.executeCommand(command, args) or []
+    debug_info.append(f"{command} args: {json.dumps(args)}")
+    debug_info.append(f"{command} raw result: {json.dumps(result, default=str)[:3000]}")
+
+    entries = [e for e in result if isinstance(e, dict) and e.get("Type") != 4]
+    if not entries:
+        error_msg = get_error(result) if is_error(result) else "Empty response"
+        raise DemistoException(f"{command} failed: {error_msg}")
+    return entries
+
+
+def entries_data(entries: list) -> list:
+    """
+    Collect everything a command returned: Contents (parsed if it is a JSON
+    string) and EntryContext of every entry.
+    """
+    data = []
+    for entry in entries:
+        contents = entry.get("Contents")
+        if isinstance(contents, str):
+            try:
+                contents = json.loads(contents)
+            except ValueError:
+                contents = None
+        if contents:
+            data.append(contents)
+        if entry.get("EntryContext"):
+            data.append(entry["EntryContext"])
+    return data
 
 
 # =============================================================================
 # ASSET GROUP HELPERS
 # =============================================================================
 
-def extract_group_id(group_data: dict) -> str | None:
+def iter_records(data):
+    """Yield every dict nested anywhere inside data (lists and dicts)."""
+    if isinstance(data, list):
+        for item in data:
+            yield from iter_records(item)
+    elif isinstance(data, dict):
+        yield data
+        for value in data.values():
+            if isinstance(value, (dict, list)):
+                yield from iter_records(value)
+
+
+def get_field(record: dict, keys: tuple):
     """
-    Extract the asset group ID from API response data.
-    
+    Return the first non-empty value among keys, matching keys case-insensitively.
+
     Args:
-        group_data: Dictionary containing asset group fields
-    
+        record: Dictionary to read from
+        keys: Candidate field names, in priority order (lowercase)
+
     Returns:
-        The group ID as a string, or None if not found
+        The value found, or None
     """
-    value = group_data.get(GROUP_ID_FIELD)
-    return str(value) if value is not None else None
+    lowered = {str(k).lower(): v for k, v in record.items()}
+    for key in keys:
+        value = lowered.get(key)
+        if value not in (None, ""):
+            return value
+    return None
 
 
-def build_membership_predicate(realm_list: list) -> dict:
+def build_membership_predicate(account_ids: list) -> dict:
     """
     Build the membership predicate for dynamic asset group filtering.
-    
+
     Creates a predicate structure that matches assets belonging to any
-    of the specified realms using OR logic within an AND wrapper.
-    
+    of the specified cloud accounts using OR logic within an AND wrapper.
+    Accounts are matched on xdm.asset.realm, which equals the cloud account ID
+    (xdm.asset.cloud.account.id) for AWS, Azure and GCP.
+
     Structure:
         {
             "AND": [{
                 "OR": [
-                    {"SEARCH_FIELD": "xdm.asset.realm", "SEARCH_TYPE": "WILDCARD", "SEARCH_VALUE": "realm1"},
-                    {"SEARCH_FIELD": "xdm.asset.realm", "SEARCH_TYPE": "WILDCARD", "SEARCH_VALUE": "realm2"},
+                    {"SEARCH_FIELD": "xdm.asset.realm", "SEARCH_TYPE": "WILDCARD", "SEARCH_VALUE": "account1"},
+                    {"SEARCH_FIELD": "xdm.asset.realm", "SEARCH_TYPE": "WILDCARD", "SEARCH_VALUE": "account2"},
                     ...
                 ]
             }]
         }
-    
+
     Args:
-        realm_list: List of realm IDs to include
-    
+        account_ids: List of cloud account IDs to include
+
     Returns:
         The membership predicate dictionary
-    
+
     Raises:
-        ValueError: If realm_list is empty
+        ValueError: If account_ids is empty
     """
-    if not realm_list:
-        raise ValueError("realm_list cannot be empty")
-    
-    # Build OR conditions - one per realm
+    if not account_ids:
+        raise ValueError("account_ids cannot be empty")
+
+    # Build OR conditions - one per account
     or_conditions = [
         {
             "SEARCH_FIELD": "xdm.asset.realm",
             "SEARCH_TYPE": "WILDCARD",
-            "SEARCH_VALUE": str(realm)
+            "SEARCH_VALUE": str(account_id)
         }
-        for realm in realm_list
+        for account_id in account_ids
     ]
-    
+
     # Wrap in AND > OR structure (required by API)
     return {"AND": [{"OR": or_conditions}]}
 
 
-def build_group_payload(group_name: str, description: str, realm_list: list) -> dict:
+def build_group_args(group_name: str, description: str, account_ids: list) -> dict:
     """
-    Build the request payload for create/update asset group API calls.
-    
+    Build the arguments shared by createAssetGroup and setAssetGroup.
+
     Args:
         group_name: Name of the asset group
         description: Description for the asset group
-        realm_list: List of realm IDs for membership predicate
-    
+        account_ids: List of cloud account IDs for membership predicate
+
     Returns:
-        The complete request payload dictionary
+        The command arguments dictionary
     """
     return {
-        "request_data": {
-            "asset_group": {
-                "group_name": group_name,
-                "group_type": GROUP_TYPE,
-                "group_description": description,
-                "membership_predicate": build_membership_predicate(realm_list)
-            }
-        }
+        "group_name": group_name,
+        "group_type": GROUP_TYPE,
+        "group_description": description,
+        "membership_json": json.dumps(build_membership_predicate(account_ids))
     }
 
 
 # =============================================================================
-# API OPERATIONS
+# COMMAND OPERATIONS
 # =============================================================================
 
-def get_existing_asset_group(group_name: str) -> dict | None:
+def get_existing_group_id(group_name: str, debug_info: list) -> str | None:
     """
     Check if an asset group with the given name already exists.
-    
+
+    The name is matched exactly on the results, in case getAssetGroup's
+    names filter does partial matching.
+
     Args:
         group_name: The name of the asset group to search for
-    
+        debug_info: List that collects debug lines
+
     Returns:
-        The asset group data dictionary if found, None otherwise
+        The ID of the matching asset group, or None if not found
+
+    Raises:
+        ValueError: If a group with this name exists but its ID can't be read
     """
-    payload = {
-        "request_data": {
-            "filters": {
-                "AND": [{
-                    "SEARCH_FIELD": "XDM.ASSET_GROUP.NAME",
-                    "SEARCH_TYPE": "EQ",
-                    "SEARCH_VALUE": group_name
-                }]
-            },
-            "search_from": 0,
-            "search_to": 100
-        }
-    }
-    
-    result = demisto.executeCommand("core-api-post", {
-        "uri": API_GET_GROUPS,
-        "body": json.dumps(payload)
-    })
-    
-    response = parse_api_response(result, "Query asset groups")
-    data = response.get("reply", {}).get("data", [])
-    
-    return data[0] if data else None
+    entries = run_command(CMD_GET_GROUP, {"names": group_name}, debug_info)
+
+    for record in iter_records(entries_data(entries)):
+        if get_field(record, GROUP_NAME_KEYS) != group_name:
+            continue
+        group_id = get_field(record, GROUP_ID_KEYS)
+        if group_id is None:
+            raise ValueError(
+                f"Found group '{group_name}' but could not extract its ID. "
+                f"Available fields: {list(record.keys())}"
+            )
+        return str(group_id)
+
+    return None
 
 
-def create_asset_group(group_name: str, description: str, realm_list: list) -> dict:
+def create_asset_group(group_name: str, description: str, account_ids: list,
+                       debug_info: list) -> str | None:
     """
     Create a new dynamic asset group.
-    
+
     Args:
         group_name: Name for the new asset group
         description: Description for the asset group
-        realm_list: List of realm IDs to include
-    
+        account_ids: List of cloud account IDs to include
+        debug_info: List that collects debug lines
+
     Returns:
-        The API response data containing the new group info
+        The new group ID, or None if it couldn't be determined
     """
-    payload = build_group_payload(group_name, description, realm_list)
-    
-    result = demisto.executeCommand("core-api-post", {
-        "uri": API_CREATE_GROUP,
-        "body": json.dumps(payload)
-    })
-    
-    response = parse_api_response(result, "Create asset group")
-    return response.get("reply", {}).get("data", {})
+    args = build_group_args(group_name, description, account_ids)
+    entries = run_command(CMD_CREATE_GROUP, args, debug_info)
+
+    for record in iter_records(entries_data(entries)):
+        group_id = get_field(record, CREATED_ID_KEYS)
+        if group_id is not None:
+            return str(group_id)
+
+    # The create result didn't carry an ID we recognize - look the group up instead
+    debug_info.append("Group ID not found in create result, looking it up by name")
+    return get_existing_group_id(group_name, debug_info)
 
 
-def update_asset_group(group_id: str, group_name: str, description: str, realm_list: list) -> dict:
+def update_asset_group(group_id: str, group_name: str, description: str, account_ids: list,
+                       debug_info: list) -> None:
     """
     Update an existing asset group.
-    
+
     Args:
         group_id: ID of the asset group to update
         group_name: New name for the asset group
         description: New description for the asset group
-        realm_list: New list of realm IDs to include
-    
-    Returns:
-        The API response data
+        account_ids: New list of cloud account IDs to include
+        debug_info: List that collects debug lines
     """
-    payload = build_group_payload(group_name, description, realm_list)
-    
-    result = demisto.executeCommand("core-api-post", {
-        "uri": f"{API_UPDATE_GROUP}/{group_id}",
-        "body": json.dumps(payload)
-    })
-    
-    response = parse_api_response(result, "Update asset group")
-    return response.get("reply", {}).get("data", {})
+    args = {"group_id": group_id, **build_group_args(group_name, description, account_ids)}
+    run_command(CMD_UPDATE_GROUP, args, debug_info)
 
 
 # =============================================================================
 # OUTPUT FORMATTING
 # =============================================================================
 
-def format_dry_run_output(group_name: str, group_id: str, action: str, realm_list: list) -> str:
+def format_dry_run_output(group_name: str, group_id: str, action: str, account_ids: list) -> str:
     """Format the human-readable output for dry run mode."""
-    realm_text = "\n".join(str(r) for r in realm_list)
+    account_text = "\n".join(str(a) for a in account_ids)
     return (
         f"### 🔍 DRY RUN - No Changes Made\n\n"
         f"**Group Name:** `{group_name}`\n"
         f"**Group ID:** `{group_id}`\n"
         f"**Action:** {action}\n"
-        f"**Realms to Include:** {len(realm_list)}\n\n"
-        f"### Realm List\n\n```\n{realm_text}\n```"
+        f"**Accounts to Include:** {len(account_ids)}\n\n"
+        f"### Account IDs\n\n```\n{account_text}\n```"
     )
 
 
-def format_success_output(group_name: str, group_id: str, action: str, realm_count: int) -> str:
+def format_success_output(group_name: str, group_id: str, action: str, account_count: int) -> str:
     """Format the human-readable output for successful execution."""
     return (
         f"### ✅ Asset Group {action.capitalize()}\n\n"
         f"**Group Name:** `{group_name}`\n"
         f"**Group ID:** `{group_id}`\n"
         f"**Action:** {action}\n"
-        f"**Realms Included:** {realm_count}\n"
+        f"**Accounts Included:** {account_count}\n"
     )
 
 
@@ -292,64 +340,66 @@ def format_success_output(group_name: str, group_id: str, action: str, realm_cou
 def main():
     """
     Main entry point for the script.
-    
+
     Parses arguments, checks for existing groups, and either creates
     a new asset group or updates an existing one. Supports dry-run
     mode for previewing changes.
     """
     try:
-        args = demisto.args()
-        
+        args = TEST_ARGS if USE_TEST_ARGS else demisto.args()  # TEMPORARY - see TEST INPUTS
+
         # Parse and validate arguments
         group_name = args.get("group_name")
-        realm_list = argToList(args.get("realm_list"))
+        account_ids = argToList(args.get("account_ids"))
         description = args.get("group_description") or DEFAULT_DESCRIPTION
         dry_run = argToBoolean(args.get("dry_run", "false"))
-        
+        debug_mode = argToBoolean(args.get("debug", "false"))
+
         if not group_name:
             raise ValueError("group_name is required")
-        if not realm_list:
-            raise ValueError("realm_list is required and cannot be empty")
-        
+        if not account_ids:
+            raise ValueError("account_ids is required and cannot be empty")
+
+        debug_info = []
+
         # Check if group already exists
-        existing_group = get_existing_asset_group(group_name)
-        is_update = existing_group is not None
-        
+        existing_id = get_existing_group_id(group_name, debug_info)
+        is_update = existing_id is not None
+
         # Determine group_id and action
         if is_update:
-            group_id = extract_group_id(existing_group)
-            if not group_id:
-                available_fields = list(existing_group.keys())
-                raise ValueError(f"Could not extract group_id. Available fields: {available_fields}")
+            group_id = existing_id
             action = "would be updated" if dry_run else "updated"
         else:
             group_id = "(new)" if dry_run else None
             action = "would be created" if dry_run else "created"
-        
+
         # Execute operation (unless dry run)
         if not dry_run:
             if is_update:
-                update_asset_group(group_id, group_name, description, realm_list)
+                update_asset_group(group_id, group_name, description, account_ids, debug_info)
             else:
-                result = create_asset_group(group_name, description, realm_list)
-                group_id = result.get("asset_group_id")
-        
+                group_id = create_asset_group(group_name, description, account_ids, debug_info)
+
         # Build output
         output = {
             "group_id": group_id,
             "group_name": group_name,
             "action": action,
-            "realm_count": len(realm_list),
+            "account_count": len(account_ids),
             "status": "dry_run" if dry_run else "success",
             "dry_run": dry_run
         }
-        
+
         if dry_run:
-            output["realms"] = realm_list
-            readable = format_dry_run_output(group_name, group_id, action, realm_list)
+            output["account_ids"] = account_ids
+            readable = format_dry_run_output(group_name, group_id, action, account_ids)
         else:
-            readable = format_success_output(group_name, group_id, action, len(realm_list))
-        
+            readable = format_success_output(group_name, group_id, action, len(account_ids))
+
+        if debug_mode:
+            readable += "\n\n### Debug Info\n\n```\n" + "\n".join(debug_info) + "\n```"
+
         # Return results
         return_results(CommandResults(
             outputs_prefix="CreateAssetGroup",
@@ -357,7 +407,7 @@ def main():
             outputs=output,
             readable_output=readable
         ))
-        
+
     except Exception as ex:
         demisto.error(traceback.format_exc())
         return_error(f"CreateAssetGroup failed: {str(ex)}")
