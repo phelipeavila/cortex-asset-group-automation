@@ -6,8 +6,8 @@ carry a specific tag, using a single XQL query on the asset_inventory dataset
 
 Each provider keeps its tags in a different place inside xdm.asset.raw_fields;
 the query extracts all of them in one pass (see XQL_QUERY_TEMPLATE):
-    - AWS:   "Platform Discovery".Tags   -> list of {"Key","Value"}, rebuilt by
-             the query as a JSON object string (tags_aws)
+    - AWS:   "Platform Discovery".Tags   -> list of {"Key","Value"} (tags_aws),
+             converted to {key: value} here
     - Azure: "Platform Discovery".tags   -> JSON object (tags_azure)
     - GCP:   "Platform Discovery".labels -> JSON object (tags_gcp)
 Tag matching (key, optional values, case sensitivity) is then done here, on the
@@ -34,8 +34,7 @@ Output:
         grouped by provider: {"AWS": [...], "AZURE": [...], "GCP": [...]})
     Context path: GetCloudAccountsByTag.results_count
     Context path: GetCloudAccountsByTag.failed_lookups (accounts whose tags could
-        not be parsed, e.g. an AWS tag value containing a double quote - they are
-        excluded from the results; review with debug=true)
+        not be parsed - they are excluded from the results; review with debug=true)
 """
 
 import json
@@ -66,7 +65,7 @@ ASSET_TYPE_BY_PROVIDER = {
 }
 ASSET_TYPES = list(ASSET_TYPE_BY_PROVIDER.values())
 
-# Query column holding each provider's tags (as a JSON object string)
+# Query column holding each provider's tags
 TAGS_COLUMN_BY_PROVIDER = {
     "aws": "tags_aws",
     "azure": "tags_azure",
@@ -78,14 +77,9 @@ XQL_QUERY_TEMPLATE = """dataset = asset_inventory
 | filter xdm.asset.type.name in ({asset_types})
 | alter cloud_provider = if(xdm.asset.type.name = "AWS Account", "aws",
                          if(xdm.asset.type.name = "Azure Subscription", "azure", "gcp"))
-| alter aws_tags   = json_extract_array(xdm.asset.raw_fields, "$.Platform Discovery.Tags"),
+| alter tags_aws   = json_extract_array(xdm.asset.raw_fields, "$.Platform Discovery.Tags"),
         tags_azure = json_extract(xdm.asset.raw_fields, "$.Platform Discovery.tags"),
         tags_gcp   = json_extract(xdm.asset.raw_fields, "$.Platform Discovery.labels")
-| alter tags_aws = if(aws_tags != null,
-        concat("{{", arraystring(arraymap(aws_tags,
-            concat("\\"", json_extract_scalar("@element", "$.Key"), "\\":\\"",
-                   coalesce(json_extract_scalar("@element", "$.Value"), ""), "\\"")), ","), "}}"),
-        null)
 | fields cloud_provider, xdm.asset.cloud.account.id as account_id, xdm.asset.name as account_name,
          tags_aws, tags_azure, tags_gcp
 | sort asc cloud_provider, asc account_id"""
@@ -207,19 +201,30 @@ def run_query(query: str, debug_info: list) -> tuple:
 def parse_tags(raw) -> dict:
     """Return a row's tags as a {key: value} dict.
 
-    The query returns each provider's tags as a JSON object string; an empty
-    value means no tags. Raises ValueError when the value can't be parsed.
+    Azure and GCP tags are a {key: value} object; AWS tags are a list of
+    {"Key", "Value"}. Either may arrive already parsed or as a JSON string (and
+    AWS list items as JSON strings too). An empty value means no tags. Raises
+    ValueError when the value can't be parsed.
     """
     if raw in (None, "", "null"):
         return {}
-    if isinstance(raw, dict):
-        return raw
-    tags = json.loads(raw)
+    tags = json.loads(raw) if isinstance(raw, str) else raw
     if tags is None:
         return {}
-    if not isinstance(tags, dict):
-        raise ValueError(f"expected a JSON object, got {type(tags).__name__}")
-    return tags
+    if isinstance(tags, dict):
+        return tags
+    if not isinstance(tags, list):
+        raise ValueError(f"expected a JSON object or list, got {type(tags).__name__}")
+
+    normalized = {}
+    for item in tags:
+        if isinstance(item, str):
+            item = json.loads(item)
+        if not isinstance(item, dict) or "Key" not in item:
+            raise ValueError(f"unexpected tag item: {item!r}")
+        value = item.get("Value")
+        normalized[str(item["Key"])] = "" if value is None else value
+    return normalized
 
 
 def row_has_tag(tags: dict, tag_key: str, tag_values: list, case_sensitive: bool) -> bool:

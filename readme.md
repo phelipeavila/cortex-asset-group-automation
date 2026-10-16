@@ -78,7 +78,7 @@ Each provider keeps its tags in a different place inside `xdm.asset.raw_fields`;
 
 | Provider | Where tags live | Query column |
 |----------|------------------|--------------|
-| AWS Account | `raw_fields["Platform Discovery"]["Tags"]` (list of `{Key, Value}`) | `tags_aws` (rebuilt by the query as a JSON object) |
+| AWS Account | `raw_fields["Platform Discovery"]["Tags"]` (list of `{Key, Value}`) | `tags_aws` (converted to `{key: value}` by the script) |
 | Azure Subscription | `raw_fields["Platform Discovery"]["tags"]` (object) | `tags_azure` |
 | GCP Project | `raw_fields["Platform Discovery"]["labels"]` (object) | `tags_gcp` |
 
@@ -118,7 +118,7 @@ Tag matching (key, optional values, case sensitivity) is then done by the script
 | `GetCloudAccountsByTag.tag_key` | String | The tag key used |
 | `GetCloudAccountsByTag.tag_value` | List | The tag values used |
 | `GetCloudAccountsByTag.cloud_provider` | List | The cloud providers requested (empty = all) |
-| `GetCloudAccountsByTag.failed_lookups` | List | Account IDs whose tags could not be parsed (e.g. an AWS tag key/value containing a double quote breaks the JSON the query builds) — **excluded** from `values`. Review these before trusting the result; such an account may actually have the tag |
+| `GetCloudAccountsByTag.failed_lookups` | List | Account IDs whose tags could not be parsed (unexpected format in the query results) — **excluded** from `values`. Review these before trusting the result; such an account may actually have the tag |
 
 ### A note on XQL query time and limits
 
