@@ -1,31 +1,22 @@
 """GetCloudAccountsByTag - Cortex XSIAM/XSOAR Script
 
 Retrieves cloud account IDs (AWS Account, Azure Subscription, GCP Project) that
-carry a specific tag, using the Assets API (/public_api/v1/assets).
+carry a specific tag, using a single XQL query on the asset_inventory dataset
+(xdr-xql-generic-query, from the Cortex XDR - XQL Query Engine integration).
 
-Azure reports tags inline, in xdm.asset.tags. AWS and GCP do NOT - their tags
-must be fetched separately per account from
-/public_api/v1/assets/{asset_id}/raw_fields (via core-api-get, asset_id in the
-URI, no body):
-    - AWS:  reply.data[0]["xdm.asset.raw_fields"]["Platform Discovery"]["Tags"]
-            -> a list of {"Key","Value"}
-    - GCP:  reply.data[0]["xdm.asset.raw_fields"]["Platform Discovery"]["labels"]
-            -> a {key: value} object
-This means one extra API call per AWS/GCP account; they are made in parallel
-(see max_workers) to keep this from being too slow on large fleets.
-
-Where each asset type gets its tags from is defined in TAG_SOURCE_BY_TYPE below.
-If a provider's tag location changes, or another type needs the raw_fields path,
-update that map - the matching logic itself does not need to change.
-
-NOTE: demisto.executeCommand is called concurrently from multiple threads here.
-If that proves unreliable in your Cortex tenant/engine, set max_workers=1 to
-fall back to sequential calls.
+Each provider keeps its tags in a different place inside xdm.asset.raw_fields;
+the query extracts all of them in one pass (see XQL_QUERY_TEMPLATE):
+    - AWS:   "Platform Discovery".Tags   -> list of {"Key","Value"}, rebuilt by
+             the query as a JSON object string (tags_aws)
+    - Azure: "Platform Discovery".tags   -> JSON object (tags_azure)
+    - GCP:   "Platform Discovery".labels -> JSON object (tags_gcp)
+Tag matching (key, optional values, case sensitivity) is then done here, on the
+query results.
 
 By default this script scans AWS Account, Azure Subscription and GCP Project
 assets (see ASSET_TYPE_BY_PROVIDER below); the cloud_provider argument narrows
-that down to one or more providers. The asset type names themselves are not
-configurable from the Cortex UI, by design.
+that down to one or more providers, in the query itself. The asset type names
+themselves are not configurable from the Cortex UI, by design.
 
 Arguments:
     tag_key (str): Required. Tag key to look for.
@@ -34,20 +25,21 @@ Arguments:
     cloud_provider (list): Optional. Comma-separated cloud providers to scan
         (AWS, Azure, GCP - case-insensitive). When empty, all providers are scanned.
     case_sensitive (bool): Optional. Default: false.
-    max_workers (int): Optional. Parallel threads for AWS raw_fields lookups.
-        Default: 10. Set to 1 for sequential (safest) execution.
-    debug (bool): Optional. Show debug info in output. Default: false.
+    debug (bool): Optional. Show debug info (query, raw rows) in output. Default: false.
 
 Output:
     Context path: GetCloudAccountsByTag.values (list of xdm.asset.cloud.account.id)
     Context path: GetCloudAccountsByTag.account_names (list of xdm.asset.name)
+    Context path: GetCloudAccountsByTag.accounts_by_provider (the same account IDs
+        grouped by provider: {"AWS": [...], "AZURE": [...], "GCP": [...]})
     Context path: GetCloudAccountsByTag.results_count
-    Context path: GetCloudAccountsByTag.failed_lookups (accounts skipped due to a
-        raw_fields fetch error - review with debug=true before trusting the result)
+    Context path: GetCloudAccountsByTag.failed_lookups (accounts whose tags could
+        not be parsed, e.g. an AWS tag value containing a double quote - they are
+        excluded from the results; review with debug=true)
 """
 
-import concurrent.futures
 import json
+import time
 import traceback
 
 
@@ -55,8 +47,15 @@ import traceback
 # CONSTANTS - Modify these to customize the script behavior
 # ============================================================================
 
-API_GET_ASSETS = "/public_api/v1/assets"
-API_GET_RAW_FIELDS = "/public_api/v1/assets/{asset_id}/raw_fields"
+XQL_COMMAND = "xdr-xql-generic-query"
+XQL_RESULTS_COMMAND = "xdr-xql-get-query-results"  # used only if the query is still pending
+XQL_QUERY_NAME = "GetCloudAccountsByTag"
+XQL_TIME_FRAME = "7 days"
+XQL_TIMEOUT_SECONDS = 300
+XQL_POLL_INTERVAL_SECONDS = 10
+
+XQL_STATUS_DONE = ("SUCCESS", "PARTIAL_SUCCESS")
+XQL_STATUS_PENDING = ("PENDING",)
 
 # Asset type scanned per cloud provider. Keys are the (lowercase) values accepted
 # by the cloud_provider argument; the asset type names are not exposed on purpose.
@@ -67,313 +66,164 @@ ASSET_TYPE_BY_PROVIDER = {
 }
 ASSET_TYPES = list(ASSET_TYPE_BY_PROVIDER.values())
 
-ASSET_TYPE_FIELD = "xdm.asset.type.name"
-ASSET_ID_FIELD = "xdm.asset.id"
-ACCOUNT_ID_FIELD = "xdm.asset.cloud.account.id"
-ASSET_NAME_FIELD = "xdm.asset.name"
-TAGS_FIELD = "xdm.asset.tags"
-RAW_FIELDS_FIELD = "xdm.asset.raw_fields"
-
-# Where to read tags from, per asset type. Every type in ASSET_TYPE_BY_PROVIDER is
-# listed explicitly; DEFAULT_TAG_SOURCE (tags inline in xdm.asset.tags) is only a
-# fallback for a type added there without a matching entry here.
-TAG_SOURCE_BY_TYPE = {
-    "AWS Account": {
-        "source": "raw_fields",
-        "category": "Platform Discovery",
-        "tags_key": "Tags",
-    },
-    "Azure Subscription": {
-        "source": "inline",
-        "field": TAGS_FIELD,
-    },
-    "GCP Project": {
-        "source": "raw_fields",
-        "category": "Platform Discovery",
-        "tags_key": "labels",
-    },
+# Query column holding each provider's tags (as a JSON object string)
+TAGS_COLUMN_BY_PROVIDER = {
+    "aws": "tags_aws",
+    "azure": "tags_azure",
+    "gcp": "tags_gcp",
 }
-DEFAULT_TAG_SOURCE = {"source": "inline", "field": TAGS_FIELD}
 
-PAGE_SIZE = 1000  # Matches the page size used by Cortex's other search_from/search_to APIs
-MAX_PAGES = 1000  # Safety net against runaway pagination (up to 1,000,000 accounts)
-
-DEFAULT_MAX_WORKERS = 10
-MAX_WORKERS_CAP = 25  # Hard ceiling so a bad argument can't hammer the API
-
-
-# ============================================================================
-# API RESPONSE HANDLING
-# ============================================================================
-
-def parse_api_response(result: list, operation: str) -> dict:
-    """Return the first valid response (containing 'reply') from a core-api-post
-    or core-api-get result.
-
-    The API can return an error entry (Type 4) ahead of the valid one, so every
-    entry is inspected instead of only the first.
-    """
-    if not result:
-        raise DemistoException(f"{operation}: Empty response from API")
-
-    for entry in result:
-        if not isinstance(entry, dict) or entry.get("Type") == 4:
-            continue
-
-        contents = entry.get("Contents", {})
-        if not isinstance(contents, dict):
-            continue
-
-        response = contents.get("response", {})
-        if response and "reply" in response:
-            return response
-
-    error_msg = get_error(result) if is_error(result) else "No valid response found"
-    raise DemistoException(f"{operation}: {error_msg}")
+# {asset_types} is replaced with the quoted, comma-separated asset type names
+XQL_QUERY_TEMPLATE = """dataset = asset_inventory
+| filter xdm.asset.type.name in ({asset_types})
+| alter cloud_provider = if(xdm.asset.type.name = "AWS Account", "aws",
+                         if(xdm.asset.type.name = "Azure Subscription", "azure", "gcp"))
+| alter aws_tags   = json_extract_array(xdm.asset.raw_fields, "$.Platform Discovery.Tags"),
+        tags_azure = json_extract(xdm.asset.raw_fields, "$.Platform Discovery.tags"),
+        tags_gcp   = json_extract(xdm.asset.raw_fields, "$.Platform Discovery.labels")
+| alter tags_aws = if(aws_tags != null,
+        concat("{{", arraystring(arraymap(aws_tags,
+            concat("\\"", json_extract_scalar("@element", "$.Key"), "\\":\\"",
+                   coalesce(json_extract_scalar("@element", "$.Value"), ""), "\\"")), ","), "}}"),
+        null)
+| fields cloud_provider, xdm.asset.cloud.account.id as account_id, xdm.asset.name as account_name,
+         tags_aws, tags_azure, tags_gcp
+| sort asc cloud_provider, asc account_id"""
 
 
 # ============================================================================
-# ASSET LISTING (paginated)
+# XQL QUERY
 # ============================================================================
 
-def resolve_asset_types(cloud_providers: list) -> list:
-    """Map the cloud_provider argument (case-insensitive) to asset types.
+def resolve_providers(cloud_providers: list) -> list:
+    """Map the cloud_provider argument (case-insensitive) to provider keys.
 
     An empty list means every provider. Unknown providers raise a ValueError
     rather than being silently ignored, so a typo can't shrink the scan.
     """
     if not cloud_providers:
-        return ASSET_TYPES
+        return list(ASSET_TYPE_BY_PROVIDER)
 
-    asset_types = []
+    providers = []
     unknown = []
     for provider in cloud_providers:
-        asset_type = ASSET_TYPE_BY_PROVIDER.get(provider.lower())
-        if asset_type is None:
+        key = provider.lower()
+        if key not in ASSET_TYPE_BY_PROVIDER:
             unknown.append(provider)
-        elif asset_type not in asset_types:
-            asset_types.append(asset_type)
+        elif key not in providers:
+            providers.append(key)
 
     if unknown:
         raise ValueError(
             f"Unknown cloud_provider: {', '.join(unknown)}. "
             f"Valid values (case-insensitive): {', '.join(ASSET_TYPE_BY_PROVIDER)}"
         )
-    return asset_types
+    return providers
 
 
-def build_filters(asset_types: list) -> dict:
-    """Build filters: type == A OR type == B ..."""
-    return {
-        "OR": [
-            {"SEARCH_FIELD": ASSET_TYPE_FIELD, "SEARCH_TYPE": "EQ", "SEARCH_VALUE": asset_type}
-            for asset_type in asset_types
-        ]
-    }
+def build_query(providers: list) -> str:
+    """Build the XQL query, scanning only the given providers' asset types."""
+    asset_types = ", ".join(f'"{ASSET_TYPE_BY_PROVIDER[p]}"' for p in providers)
+    return XQL_QUERY_TEMPLATE.format(asset_types=asset_types)
 
 
-def get_account_assets(asset_types: list, debug_info: list) -> list:
-    """Fetch every account-level asset of the given types, paginating with search_from/search_to.
+def iter_records(data):
+    """Yield every dict nested anywhere inside data (lists and dicts)."""
+    if isinstance(data, list):
+        for item in data:
+            yield from iter_records(item)
+    elif isinstance(data, dict):
+        yield data
+        for value in data.values():
+            if isinstance(value, (dict, list)):
+                yield from iter_records(value)
 
-    Pages until the API returns fewer than PAGE_SIZE results (or filter_count is reached),
-    so tenants with more than one page of matching accounts are handled correctly.
+
+def find_query_data(result: list, operation: str) -> dict:
+    """Return the query status object ({status, execution_id, results, ...}) from
+    an XQL command result.
+
+    It is looked for in Contents and EntryContext, since its exact location
+    isn't documented. Error entries (Type 4) are skipped.
     """
-    all_assets = []
-    offset = 0
-    filters = build_filters(asset_types)
-    last_page_first_id = None
+    for entry in result or []:
+        if not isinstance(entry, dict) or entry.get("Type") == 4:
+            continue
+        for data in (entry.get("Contents"), entry.get("EntryContext")):
+            for record in iter_records(data):
+                if "status" in record and ("results" in record or "execution_id" in record):
+                    return record
 
-    for page_num in range(MAX_PAGES):
-        payload = {
-            "request_data": {
-                "filters": filters,
-                "sort": [{"FIELD": ASSET_NAME_FIELD, "ORDER": "DESC"}],
-                "search_from": offset,
-                "search_to": offset + PAGE_SIZE,
-            }
-        }
-        debug_info.append(f"Fetching assets {offset} to {offset + PAGE_SIZE}")
-
-        result = demisto.executeCommand("core-api-post", {
-            "uri": API_GET_ASSETS,
-            "body": json.dumps(payload),
-        })
-        reply = parse_api_response(result, "Query assets").get("reply", {})
-
-        assets = reply.get("data", []) or []
-        # metadata.total_count is the whole tenant's asset count; filter_count is the filtered one
-        filter_count = (reply.get("metadata") or {}).get("filter_count")
-        if offset == 0:
-            debug_info.append(f"filter_count reported by API: {filter_count}")
-
-        if not assets:
-            debug_info.append(f"Page {page_num + 1}: empty page, stopping")
-            break
-
-        # Defensive check: if the API ignores search_from and keeps returning the same
-        # page, stop instead of looping until MAX_PAGES.
-        page_first_id = assets[0].get(ACCOUNT_ID_FIELD)
-        if offset > 0 and page_first_id is not None and page_first_id == last_page_first_id:
-            debug_info.append(
-                f"Page {page_num + 1}: identical to previous page (search_from not advancing) - stopping"
-            )
-            break
-        last_page_first_id = page_first_id
-
-        all_assets.extend(assets)
-        debug_info.append(f"Page {page_num + 1}: fetched {len(assets)} assets (running total: {len(all_assets)})")
-
-        if len(assets) < PAGE_SIZE or (filter_count is not None and len(all_assets) >= filter_count):
-            break
-        offset += PAGE_SIZE
-    else:
-        debug_info.append(f"WARNING: stopped after reaching MAX_PAGES ({MAX_PAGES}); results may be incomplete")
-
-    return all_assets
+    error_msg = get_error(result) if is_error(result) else "No query results found"
+    raise DemistoException(f"{operation}: {error_msg}")
 
 
-# ============================================================================
-# RAW FIELDS LOOKUP (needed for asset types whose tags aren't inline, e.g. AWS)
-# ============================================================================
+def run_query(query: str, debug_info: list) -> tuple:
+    """Run the XQL query and return (rows, warning).
 
-def get_tag_source(asset_type: str) -> dict:
-    """Return where to read tags from for this asset type (see TAG_SOURCE_BY_TYPE)."""
-    return TAG_SOURCE_BY_TYPE.get(asset_type, DEFAULT_TAG_SOURCE)
-
-
-def fetch_raw_fields(asset_id: str) -> dict | None:
-    """Call /public_api/v1/assets/{asset_id}/raw_fields and return the raw_fields dict.
-
-    Returns None when the API returned no record at all for this asset_id, which is
-    reported separately from both successes and errors: such an account ends up
-    treated as untagged, so it's worth knowing it happened.
+    When the command returns while the query is still pending, its results are
+    polled with xdr-xql-get-query-results until done or XQL_TIMEOUT_SECONDS.
+    warning is set when the query reports more results than it returned.
     """
-    result = demisto.executeCommand("core-api-get", {
-        "uri": API_GET_RAW_FIELDS.format(asset_id=asset_id),
+    debug_info.append(f"XQL query:\n{query}")
+    result = demisto.executeCommand(XQL_COMMAND, {
+        "query": query,
+        "time_frame": XQL_TIME_FRAME,
+        "query_name": XQL_QUERY_NAME,
     })
-    reply = parse_api_response(result, f"Query raw_fields for {asset_id}").get("reply", {})
-    data = reply.get("data") or []
-    if not data:
-        return None
-    return data[0].get(RAW_FIELDS_FIELD) or {}
+    data = find_query_data(result, XQL_COMMAND)
 
+    deadline = time.time() + XQL_TIMEOUT_SECONDS
+    while str(data.get("status")).upper() in XQL_STATUS_PENDING:
+        execution_id = data.get("execution_id")
+        if not execution_id:
+            raise DemistoException("XQL query is pending but returned no execution_id to poll")
+        if time.time() > deadline:
+            raise DemistoException(f"XQL query {execution_id} still pending after {XQL_TIMEOUT_SECONDS}s")
+        debug_info.append(f"Query {execution_id} pending, polling again in {XQL_POLL_INTERVAL_SECONDS}s")
+        time.sleep(XQL_POLL_INTERVAL_SECONDS)  # noqa: polling an async query
+        result = demisto.executeCommand(XQL_RESULTS_COMMAND, {"query_id": execution_id})
+        data = find_query_data(result, XQL_RESULTS_COMMAND)
 
-def extract_tags_from_raw_fields(raw_fields: dict, tag_source: dict) -> dict | list:
-    """Pull the tags out of a raw_fields dict per tag_source's category/tags_key.
+    status = str(data.get("status")).upper()
+    if status not in XQL_STATUS_DONE:
+        raise DemistoException(f"XQL query failed with status {status}: {data.get('error') or ''}")
 
-    Returns whatever shape the provider uses (a list of {Key,Value} for AWS, a
-    {key: value} object for GCP); normalize_tags handles both.
-    """
-    if not isinstance(raw_fields, dict):
-        return []
-    category_data = raw_fields.get(tag_source.get("category"), {})
-    if not isinstance(category_data, dict):
-        return []
-    return category_data.get(tag_source.get("tags_key", "Tags"), []) or []
+    rows = [r for r in (data.get("results") or []) if isinstance(r, dict)]
+    reported = data.get("number_of_results")
+    debug_info.append(f"Query status: {status}, rows returned: {len(rows)}, number_of_results: {reported}")
 
-
-def fetch_raw_tags_for_assets(assets: list, max_workers: int, debug_info: list) -> tuple:
-    """Fetch raw_fields for each asset in parallel.
-
-    Returns (raw_fields_by_asset_id, failed_assets), where failed_assets is a list
-    of (asset, error_message) for assets whose raw_fields call raised an exception -
-    those are excluded from results rather than aborting the whole script.
-
-    Assets for which the API returned no record are counted separately (and logged
-    to debug_info): they are not errors, but they do end up treated as untagged.
-    """
-    if not assets:
-        return {}, []
-
-    def _fetch(asset):
-        asset_id = asset.get(ASSET_ID_FIELD)
-        if not asset_id:
-            return asset, None, "asset has no xdm.asset.id"
-        try:
-            return asset, fetch_raw_fields(asset_id), None
-        except Exception as ex:  # noqa: BLE001 - one bad account must not abort the batch
-            return asset, None, str(ex)
-
-    debug_info.append(f"Fetching raw_fields for {len(assets)} account(s) with max_workers={max_workers}")
-
-    raw_fields_by_asset_id = {}
-    failed_assets = []
-    empty_assets = []
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(_fetch, asset) for asset in assets]
-        for future in concurrent.futures.as_completed(futures):
-            asset, raw_fields, error = future.result()
-            if error:
-                failed_assets.append((asset, error))
-            elif raw_fields is None:
-                # API answered, but with no record for this asset
-                empty_assets.append(asset)
-            else:
-                raw_fields_by_asset_id[asset.get(ASSET_ID_FIELD)] = raw_fields
-
-    debug_info.append(
-        f"raw_fields lookups: {len(raw_fields_by_asset_id)} succeeded, "
-        f"{len(empty_assets)} returned no data, {len(failed_assets)} failed"
-    )
-    if empty_assets:
-        sample = "\n".join(f"  {a.get(ACCOUNT_ID_FIELD)}" for a in empty_assets[:20])
-        debug_info.append(
-            f"raw_fields returned no data - treated as untagged (first 20):\n{sample}"
-        )
-    if failed_assets:
-        sample = "\n".join(
-            f"  {a.get(ACCOUNT_ID_FIELD)}: {err}" for a, err in failed_assets[:20]
-        )
-        debug_info.append(f"raw_fields failures (first 20):\n{sample}")
-
-    return raw_fields_by_asset_id, failed_assets
+    warning = None
+    if isinstance(reported, int) and reported > len(rows):
+        warning = (f"The query reported {reported} results but only {len(rows)} were returned - "
+                   f"the result may be incomplete.")
+    return rows, warning
 
 
 # ============================================================================
 # TAG MATCHING
 # ============================================================================
 
-def normalize_tags(tags) -> dict:
-    """Return tags as a {key: value} dict.
+def parse_tags(raw) -> dict:
+    """Return a row's tags as a {key: value} dict.
 
-    xdm.asset.tags normally arrives as an object; AWS raw_fields Tags arrive as a
-    list of {"Key","Value"}; ["key:value"] strings are handled defensively too.
+    The query returns each provider's tags as a JSON object string; an empty
+    value means no tags. Raises ValueError when the value can't be parsed.
     """
-    if isinstance(tags, dict):
-        return tags
-
-    normalized = {}
-    if isinstance(tags, list):
-        for item in tags:
-            if isinstance(item, dict):
-                key = item.get("key", item.get("Key"))
-                if key is not None:
-                    normalized[str(key)] = item.get("value", item.get("Value", ""))
-            elif isinstance(item, str):
-                key, _, value = item.partition(":")
-                normalized[key] = value
-    return normalized
+    if raw in (None, "", "null"):
+        return {}
+    if isinstance(raw, dict):
+        return raw
+    tags = json.loads(raw)
+    if tags is None:
+        return {}
+    if not isinstance(tags, dict):
+        raise ValueError(f"expected a JSON object, got {type(tags).__name__}")
+    return tags
 
 
-def get_tags_for_asset(asset: dict, raw_fields_by_asset_id: dict) -> dict | list | None:
-    """Return this asset's raw tags (dict, list or None - normalize_tags handles all
-    three), from whichever source applies to its type. Returns [] if a raw_fields
-    lookup was needed but is missing (the lookup failed, or returned no data) -
-    such an asset is treated as having no tags.
-    """
-    tag_source = get_tag_source(asset.get(ASSET_TYPE_FIELD))
-    if tag_source["source"] == "raw_fields":
-        raw_fields = raw_fields_by_asset_id.get(asset.get(ASSET_ID_FIELD))
-        if raw_fields is None:
-            return []
-        return extract_tags_from_raw_fields(raw_fields, tag_source)
-    return asset.get(tag_source["field"])
-
-
-def asset_has_tag(asset: dict, tag_key: str, tag_values: list, case_sensitive: bool,
-                  raw_fields_by_asset_id: dict) -> bool:
-    """True if the asset has tag_key (and, when tag_values is set, one of those values)."""
+def row_has_tag(tags: dict, tag_key: str, tag_values: list, case_sensitive: bool) -> bool:
+    """True if tags has tag_key (and, when tag_values is set, one of those values)."""
     def norm(val):
         text = str(val) if val is not None else ""
         return text if case_sensitive else text.lower()
@@ -381,8 +231,7 @@ def asset_has_tag(asset: dict, tag_key: str, tag_values: list, case_sensitive: b
     wanted_key = norm(tag_key)
     wanted_values = {norm(v) for v in tag_values}
 
-    tags = get_tags_for_asset(asset, raw_fields_by_asset_id)
-    for key, value in normalize_tags(tags).items():
+    for key, value in tags.items():
         if norm(key) != wanted_key:
             continue
         if not wanted_values or norm(value) in wanted_values:
@@ -390,18 +239,47 @@ def asset_has_tag(asset: dict, tag_key: str, tag_values: list, case_sensitive: b
     return False
 
 
+def match_rows(rows: list, tag_key: str, tag_values: list, case_sensitive: bool,
+               debug_info: list) -> tuple:
+    """Return (matching rows, rows whose tags couldn't be parsed)."""
+    matched = []
+    failed = []
+
+    for row in rows:
+        provider = str(row.get("cloud_provider") or "").lower()
+        column = TAGS_COLUMN_BY_PROVIDER.get(provider)
+        if column is None:
+            failed.append((row, f"unknown cloud_provider {provider!r}"))
+            continue
+        try:
+            tags = parse_tags(row.get(column))
+        except ValueError as ex:  # json.JSONDecodeError is a ValueError
+            failed.append((row, f"could not parse {column}: {ex}"))
+            continue
+        if row_has_tag(tags, tag_key, tag_values, case_sensitive):
+            matched.append(row)
+
+    if failed:
+        sample = "\n".join(f"  {r.get('account_id')}: {err}" for r, err in failed[:20])
+        debug_info.append(f"Rows whose tags could not be parsed (first 20):\n{sample}")
+    return matched, failed
+
+
 # ============================================================================
 # EXTRACTION AND OUTPUT
 # ============================================================================
 
-def extract_accounts(assets: list) -> tuple:
-    """Return (unique account IDs, account names) preserving API order."""
+def extract_accounts(rows: list) -> tuple:
+    """Return (unique account IDs, account names, account IDs grouped by provider)
+    preserving query order. Providers are keyed in uppercase (AWS, AZURE, GCP),
+    matching the AppSec Applications API provider values."""
     seen = set()
     account_ids = []
     account_names = []
+    accounts_by_provider = {}
 
-    for asset in assets:
-        account_id = asset.get(ACCOUNT_ID_FIELD)
+    for row in rows:
+        account_id = row.get("account_id")
         if not account_id:
             continue
         account_id = str(account_id)
@@ -410,32 +288,38 @@ def extract_accounts(assets: list) -> tuple:
         seen.add(account_id)
         account_ids.append(account_id)
 
-        name = asset.get(ASSET_NAME_FIELD)
+        provider = str(row.get("cloud_provider") or "other").upper()
+        accounts_by_provider.setdefault(provider, []).append(account_id)
+
+        name = row.get("account_name")
         if name:
             account_names.append(str(name))
 
-    return account_ids, account_names
+    return account_ids, account_names, accounts_by_provider
 
 
-def build_output(tag_key: str, tag_values: list, case_sensitive: bool, asset_types: list,
-                 total_assets: int, account_ids: list, account_names: list,
-                 failed_lookups: list, debug_mode: bool) -> str:
+def build_output(tag_key: str, tag_values: list, case_sensitive: bool, providers: list,
+                 total_rows: int, account_ids: list, account_names: list,
+                 failed_lookups: list, warning: str | None, debug_mode: bool) -> str:
     """Build human-readable output for War Room."""
     case_mode = "case-sensitive" if case_sensitive else "case-insensitive"
     value_display = ", ".join(f"`{v}`" for v in tag_values) if tag_values else "(any)"
+    asset_types = [ASSET_TYPE_BY_PROVIDER[p] for p in providers]
 
     output = (
         f"**Tag Key:** `{tag_key}` ({case_mode})\n"
         f"**Tag Value:** {value_display}\n"
         f"**Asset Types:** {', '.join(f'`{t}`' for t in asset_types)}\n"
-        f"**Accounts Scanned:** {total_assets}\n"
+        f"**Accounts Scanned:** {total_rows}\n"
         f"**Accounts Matched:** {len(account_ids)}\n"
     )
 
+    if warning:
+        output += f"\n⚠️ **{warning}**\n"
     if failed_lookups:
         output += (
             f"\n⚠️ **{len(failed_lookups)} account(s) could not be checked** "
-            f"(raw_fields fetch failed) and are excluded from the results above. "
+            f"(tags could not be parsed) and are excluded from the results above. "
             f"Re-run with `debug=true` to see which ones.\n"
         )
 
@@ -461,48 +345,26 @@ def main():
         case_sensitive = argToBoolean(args.get("case_sensitive", "false"))
         debug_mode = argToBoolean(args.get("debug", "false"))
 
-        try:
-            max_workers = int(args.get("max_workers") or DEFAULT_MAX_WORKERS)
-        except (TypeError, ValueError):
-            raise ValueError("max_workers must be an integer")
-        max_workers = max(1, min(max_workers, MAX_WORKERS_CAP))
-
         if not tag_key:
             raise ValueError("tag_key is required")
 
-        asset_types = resolve_asset_types(cloud_providers)
+        providers = resolve_providers(cloud_providers)
 
         debug_info = [
             f"Arguments - tag_key: {tag_key}, tag_value: {tag_values}, "
-            f"cloud_provider: {cloud_providers}, case_sensitive: {case_sensitive}, "
-            f"max_workers: {max_workers}",
-            f"Asset types scanned: {asset_types}",
+            f"cloud_provider: {cloud_providers}, case_sensitive: {case_sensitive}",
         ]
 
-        assets = get_account_assets(asset_types, debug_info)
-        debug_info.append(f"Accounts fetched: {len(assets)}")
+        rows, warning = run_query(build_query(providers), debug_info)
+        matched, failed = match_rows(rows, tag_key, tag_values, case_sensitive, debug_info)
+        debug_info.append(f"Accounts with matching tag: {len(matched)}")
 
-        # Only accounts whose type needs a raw_fields lookup (e.g. AWS) require the
-        # extra per-account call; everyone else already has tags inline.
-        raw_fields_assets = [
-            a for a in assets if get_tag_source(a.get(ASSET_TYPE_FIELD))["source"] == "raw_fields"
-        ]
-        raw_fields_by_asset_id, failed_lookups = fetch_raw_tags_for_assets(
-            raw_fields_assets, max_workers, debug_info
-        )
+        account_ids, account_names, accounts_by_provider = extract_accounts(matched)
+        failed_account_ids = [r.get("account_id") for r, _ in failed]
 
-        tagged = [
-            a for a in assets
-            if asset_has_tag(a, tag_key, tag_values, case_sensitive, raw_fields_by_asset_id)
-        ]
-        debug_info.append(f"Accounts with matching tag: {len(tagged)}")
-
-        account_ids, account_names = extract_accounts(tagged)
-        failed_account_ids = [a.get(ACCOUNT_ID_FIELD) for a, _ in failed_lookups]
-
-        readable = build_output(tag_key, tag_values, case_sensitive, asset_types,
-                                len(assets), account_ids, account_names,
-                                failed_account_ids, debug_mode)
+        readable = build_output(tag_key, tag_values, case_sensitive, providers,
+                                len(rows), account_ids, account_names,
+                                failed_account_ids, warning, debug_mode)
         if debug_mode:
             readable += "\n\n### Debug Info\n\n```\n" + "\n".join(debug_info) + "\n```"
 
@@ -516,6 +378,7 @@ def main():
                 "results_count": len(account_ids),
                 "values": account_ids,
                 "account_names": account_names,
+                "accounts_by_provider": accounts_by_provider,
                 "failed_lookups": failed_account_ids,
             },
             readable_output=readable,

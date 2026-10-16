@@ -70,24 +70,26 @@ Retrieves cloud account IDs filtered by account name using the Cloud Onboarding 
 
 ## Script 1b: GetCloudAccountsByTag
 
-Retrieves cloud account IDs (AWS Account, Azure Subscription, GCP Project) that carry a specific tag, using the Assets API (`/public_api/v1/assets`). By default all three providers are scanned; use `cloud_provider` to narrow the scan to one or more of them. The provider → asset type mapping is fixed (`ASSET_TYPE_BY_PROVIDER` in the script).
+Retrieves cloud account IDs (AWS Account, Azure Subscription, GCP Project) that carry a specific tag, using a **single XQL query** on the `asset_inventory` dataset (`xdr-xql-generic-query`). By default all three providers are scanned; use `cloud_provider` to narrow the scan to one or more of them (applied in the query itself). The provider → asset type mapping is fixed (`ASSET_TYPE_BY_PROVIDER` in the script).
 
-Tags are **not** all returned the same way by the platform:
+> **Requires** the **Cortex XDR - XQL Query Engine** integration to be enabled (it provides `xdr-xql-generic-query` and `xdr-xql-get-query-results`). Each run consumes XQL query quota.
 
-| Provider | Where tags live | How this script gets them |
-|----------|------------------|----------------------------|
-| Azure Subscription | Inline, in `xdm.asset.tags` on the asset returned by `/public_api/v1/assets` | Read directly, no extra call |
-| AWS Account | `raw_fields` only — `xdm.asset.raw_fields["Platform Discovery"]["Tags"]` (list of `{Key, Value}`) | One extra `core-api-get` call per account to `/public_api/v1/assets/{asset_id}/raw_fields` |
-| GCP Project | `raw_fields` only — `xdm.asset.raw_fields["Platform Discovery"]["labels"]` (object) | Same as AWS, different field name |
+Each provider keeps its tags in a different place inside `xdm.asset.raw_fields`; the query extracts all of them in one pass:
 
-The extra per-account calls for AWS/GCP are made in parallel (thread pool) so this stays reasonably fast on large fleets — see `max_workers` below. Which asset types need the extra call is defined in the `TAG_SOURCE_BY_TYPE` constant in the script; if a provider's tag location ever changes, that's the only place to update.
+| Provider | Where tags live | Query column |
+|----------|------------------|--------------|
+| AWS Account | `raw_fields["Platform Discovery"]["Tags"]` (list of `{Key, Value}`) | `tags_aws` (rebuilt by the query as a JSON object) |
+| Azure Subscription | `raw_fields["Platform Discovery"]["tags"]` (object) | `tags_azure` |
+| GCP Project | `raw_fields["Platform Discovery"]["labels"]` (object) | `tags_gcp` |
+
+Tag matching (key, optional values, case sensitivity) is then done by the script on the query results. The query is the `XQL_QUERY_TEMPLATE` constant in the script; if a provider's tag location ever changes, that's the place to update.
 
 ### Script Settings
 
 | Field | Value |
 |-------|-------|
 | **Name** | `GetCloudAccountsByTag` |
-| **Description** | Retrieves cloud account IDs filtered by tag key/value using the Assets API. Works with AWS, Azure and GCP. |
+| **Description** | Retrieves cloud account IDs filtered by tag key/value using an XQL query on asset_inventory. Works with AWS, Azure and GCP. |
 
 ### Input Arguments
 
@@ -97,8 +99,7 @@ The extra per-account calls for AWS/GCP are made in parallel (thread pool) so th
 | `tag_value` | Array | No | — | Tag values to match (any of them). If empty, any account with the key matches, regardless of value |
 | `cloud_provider` | Array | No | — | Cloud providers to scan: `AWS`, `Azure`, `GCP` (case-insensitive, comma-separated). If empty, all providers are scanned. Unknown values fail the script |
 | `case_sensitive` | Boolean | No | `false` | Enable case-sensitive matching on key and value |
-| `max_workers` | Number | No | `10` | Parallel threads used for the AWS/GCP `raw_fields` lookups (capped at 25). Set to `1` for sequential calls if concurrent `core-api-get`/`core-api-post` calls prove unreliable in your tenant |
-| `debug` | Boolean | No | `false` | Show debug info (pagination, raw_fields fetch stats, failures) in output |
+| `debug` | Boolean | No | `false` | Show debug info (the XQL query, row counts, tags that could not be parsed) in output |
 
 > **Important:** For the `tag_value` and `cloud_provider` arguments, enable the **"Is array"** checkbox in the script configuration to accept multiple values.
 >
@@ -112,25 +113,18 @@ The extra per-account calls for AWS/GCP are made in parallel (thread pool) so th
 |--------------|------|--------------|
 | `GetCloudAccountsByTag.values` | List | List of `xdm.asset.cloud.account.id` matching the tag (deduplicated) |
 | `GetCloudAccountsByTag.account_names` | List | List of matching account names |
+| `GetCloudAccountsByTag.accounts_by_provider` | Object | The same account IDs grouped by provider: `{"AWS": [...], "AZURE": [...], "GCP": [...]}` |
 | `GetCloudAccountsByTag.results_count` | Number | Count of accounts found |
 | `GetCloudAccountsByTag.tag_key` | String | The tag key used |
 | `GetCloudAccountsByTag.tag_value` | List | The tag values used |
 | `GetCloudAccountsByTag.cloud_provider` | List | The cloud providers requested (empty = all) |
-| `GetCloudAccountsByTag.failed_lookups` | List | Account IDs whose `raw_fields` call failed — **excluded** from `values`. Review these before trusting the result; a failed account may actually have the tag |
+| `GetCloudAccountsByTag.failed_lookups` | List | Account IDs whose tags could not be parsed (e.g. an AWS tag key/value containing a double quote breaks the JSON the query builds) — **excluded** from `values`. Review these before trusting the result; such an account may actually have the tag |
 
-### A note on `raw_fields` cost and script timeout
+### A note on XQL query time and limits
 
-For AWS and GCP, every account of that type in scope gets an individual `raw_fields` call — tags can't be filtered server-side for those providers, only fetched account by account. On large fleets this is the slowest part of the script; use `debug=true` on the first run to see how many calls were made, how many returned no data, and whether any failed.
-
-Rough wall-clock estimate, assuming ~0.3s per call:
-
-| AWS/GCP accounts | `max_workers=10` | `max_workers=25` |
-|------------------|------------------|------------------|
-| 200 | ~6s | ~2s |
-| 1,000 | ~30s | ~12s |
-| 5,000 | ~150s | ~60s |
-
-> **Important:** on AWS-heavy tenants this can exceed the script's execution timeout. Raise the **timeout** value in the script configuration in Cortex to comfortably cover the estimate above for your account count, otherwise the script is killed mid-run and the playbook gets no result.
+- The query is asynchronous. If `xdr-xql-generic-query` returns while it is still pending, the script polls `xdr-xql-get-query-results` every `XQL_POLL_INTERVAL_SECONDS` (10s) for up to `XQL_TIMEOUT_SECONDS` (300s). Keep the script **timeout** in Cortex above that.
+- The query runs over `XQL_TIME_FRAME` (`7 days`).
+- If the query reports more results than it returned (`number_of_results` greater than the rows received), the output shows a warning that the result may be incomplete.
 
 ---
 
@@ -265,16 +259,16 @@ Both account-selection scripts feed the same `CreateAssetGroup` script; pick whi
 - Run with `debug="true"` to see pagination details
 
 ### GetCloudAccountsByTag returns no results
-- Run with `debug="true"` to see how many accounts were scanned, how many `raw_fields` lookups succeeded / returned no data / failed, and how many matched
-- Check `GetCloudAccountsByTag.failed_lookups` — a non-empty list means some AWS/GCP accounts couldn't be checked and may be missing from the result
-- The debug output also lists accounts whose `raw_fields` call returned **no data**. These are not errors, but they are treated as untagged, so they never match — if that list is unexpectedly large, the tag data may not be populated for those accounts
+- Run with `debug="true"` to see the exact XQL query, how many rows it returned and how many matched
+- Run the query from the debug output in the XQL Query Builder to inspect the `tags_aws` / `tags_azure` / `tags_gcp` columns for the accounts you expect
+- Check `GetCloudAccountsByTag.failed_lookups` — a non-empty list means some accounts' tags couldn't be parsed and may be missing from the result
 - Confirm `tag_key` (and `tag_value`, if set) match the real tag casing, or set `case_sensitive=false` (the default)
-- If only AWS/GCP accounts are missing but Azure ones show up fine, the `raw_fields` calls are likely failing — check the debug output for the error message
+- If it fails with `xdr-xql-generic-query: ...`, check that the Cortex XDR - XQL Query Engine integration is enabled
 
 ### GetCloudAccountsByTag is slow or times out
-- Every AWS/GCP account requires its own `raw_fields` call; this is the expensive part of the script
-- Set `cloud_provider` to only the provider(s) you need — e.g. excluding `AWS`/`GCP` skips their `raw_fields` calls entirely
-- Increase `max_workers` (up to 25) for more parallelism, or lower it to `1` if you suspect concurrent `core-api-get` calls are causing issues in your tenant
+- The whole lookup is a single XQL query; if it times out, check the query in the XQL Query Builder and the tenant's XQL quota
+- Set `cloud_provider` to only the provider(s) you need to shrink the query
+- Raise `XQL_TIMEOUT_SECONDS` in the script (and the script timeout in Cortex) if the query legitimately takes longer
 
 ---
 
