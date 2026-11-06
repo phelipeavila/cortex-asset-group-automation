@@ -7,7 +7,7 @@ There are two ways to select accounts, each paired with the same `CreateAssetGro
 - **By name:** `GetCloudAccounts` (Cloud Onboarding APIs, filters on account name)
 - **By tag:** `GetCloudAccountsByTag` (Assets API, filters on a tag key/value)
 
-`CreateApplication` builds AppSec Business Applications from the accounts that carry a tag. It is self-contained: it runs the same XQL tag lookup as `GetCloudAccountsByTag` itself.
+`CreateApplication` takes a tag key and, for each of its values, builds an AppSec Business Application and a dynamic asset group named after the value. It is self-contained: it runs the same XQL tag lookup as `GetCloudAccountsByTag` and the same asset group commands as `CreateAssetGroup` itself.
 
 
 ---
@@ -183,22 +183,30 @@ The membership filter sent in `membership_json` matches `xdm.asset.realm` agains
 
 ## Script 3: CreateApplication
 
-Creates or updates AppSec **Business Applications** from the cloud accounts that carry a given tag. It finds the accounts with the same single XQL query as `GetCloudAccountsByTag` (embedded in the script, so it doesn't depend on it), groups them by provider and creates one application per provider, using the AppSec Applications API (`/public_api/appsec/v1/application`) through `core-api-get` / `core-api-post` / `core-api-put` / `core-api-delete`.
+Takes a **tag key**, finds every AWS Account, Azure Subscription and GCP Project that carries it, and **for each tag value** creates or updates:
+
+1. AppSec **Business Application(s)** named after the value, using the AppSec Applications API (`/public_api/appsec/v1/application`) through `core-api-get` / `core-api-post` / `core-api-put` / `core-api-delete`
+2. One dynamic **asset group** named after the value, with the value's accounts from every provider, using `getAssetGroup` / `createAssetGroup` / `setAssetGroup` (same as `CreateAssetGroup`). Asset groups are handled after all the applications
+
+The accounts are found with the same single XQL query as `GetCloudAccountsByTag` (embedded in the script, so it doesn't depend on it).
 
 > **Required license:** Cortex Cloud Posture Management or Cortex Cloud Runtime Security with the Application Security add-on.
 >
-> **Requires** the **Cortex XDR - XQL Query Engine** integration (for the tag lookup) and the Core REST API commands `core-api-get` / `core-api-post` / `core-api-put` / `core-api-delete`.
+> **Requires** the **Cortex XDR - XQL Query Engine** integration (for the tag lookup), the Core REST API commands `core-api-get` / `core-api-post` / `core-api-put` / `core-api-delete`, and the asset group commands.
 
-### Naming: one application per provider
+### Naming: one application per provider, one asset group per value
 
-An application's asset filter takes a single provider, so:
+Example with `tag_key=App`: accounts tagged `App=billing` in AWS and Azure, and `App=crm` only in GCP.
 
-| Tagged accounts found in | Applications created/updated |
-|---|---|
-| One provider (e.g. only AWS) | One, named exactly `application_name` |
-| Several providers (e.g. AWS and GCP) | One per provider: `<application_name> - AWS`, `<application_name> - GCP` |
+| Tag value | Accounts found in | Applications | Asset group |
+|---|---|---|---|
+| `billing` | AWS and Azure | `billing - AWS`, `billing - AZURE` | `billing` (AWS + Azure accounts) |
+| `crm` | GCP only | `crm` | `crm` |
 
-The suffix format is the `APP_NAME_FORMAT` constant in the script. If the provider mix changes between runs (e.g. `Sales` was created when only AWS matched, and now GCP matches too, so `Sales - AWS` and `Sales - GCP` are created), the old application is **not** touched; the output lists it so you can review and delete it.
+An application's asset filter takes a single provider, hence one application per provider when a value spans several (the suffix format is the `APP_NAME_FORMAT` constant). If a value's provider mix changes between runs (e.g. `Sales` was created when only AWS matched, and now GCP matches too, so `Sales - AWS` and `Sales - GCP` are created), the old application is **not** touched; the output lists it so you can review and delete it.
+
+- With `case_sensitive=false` (default), values that differ only in case (`Billing`, `billing`) are merged and named after the first spelling found; the output lists the merged spellings. With `true` they are kept apart.
+- Accounts whose tag has an **empty value** are ignored (there is no name to give them); the output says how many and which.
 
 Each application selects its assets with a `run` section `ACCOUNT` filter:
 
@@ -207,66 +215,88 @@ Each application selects its assets with a `run` section `ACCOUNT` filter:
  "filter": {"filterType": "ACCOUNT", "provider": "AWS", "values": ["111111111111", "222222222222"]}}
 ```
 
+Each asset group matches `xdm.asset.realm` against every account of the value (OR), like `CreateAssetGroup`.
+
 ### Updating: the account list can't be changed in place
 
-The update API (`PUT /application/{id}`) only accepts metadata (criticality, owners, description...), **not** the asset selection. When an application already exists and its accounts differ from the tagged ones:
+The update API (`PUT /application/{id}`) only accepts metadata (criticality, owners, description...), **not** the asset selection.
+
+> The API reference lists an `assetSelectionValues` field on `PUT`, which would re-resolve the selection in place. Tested on 2026-11-06: the tenant rejects it with `422 "assetSelectionValues" is an excess property`. Re-test it when the API is updated; if it starts working, the delete + create below won't be needed anymore.
+
+> **API reference vs. tenant (tested 2026-11-06):** the API reference also lists the owner fields `vpEngOwners`, `securityChampionOwners`, `devopsItOwners` and `tags` on create and update (older versions listed `devOwner`, `devOpsOwner`, `productManager`). The tenant rejected **all of them**, on both `POST` and `PUT`, with `422 "..." is an excess property`; only `businessOwner` and `compliance` (as an array) were accepted. That's why the script only exposes `business_owner`. An unknown field fails the whole call, so re-test before adding any of them.
+
+When an application already exists and its accounts differ from the tagged ones:
 
 | `recreate_on_change` | What happens |
 |---|---|
-| `false` (default) | Metadata is updated; the account selection is left as is and a warning is returned |
-| `true` | The application is deleted and created again with the new accounts. Its metadata is carried over, but it gets a **new application ID** and manual asset overrides are lost. If the create fails after the delete, the application is gone, so run with `dry_run=true` first |
+| `true` (default) | The application is deleted and created again with the new accounts. Its metadata is carried over, but it gets a **new application ID**, manual asset overrides are lost (the output warns when the application had any). If the create fails after the delete, the application is gone, so run with `dry_run=true` first |
+| `false` | Metadata is updated; the account selection is left as is and a warning is returned |
+
+Asset groups don't have this limitation: an existing group's membership is always updated.
 
 ### Script Settings
 
 | Field | Value |
 |-------|-------|
 | **Name** | `CreateApplication` |
-| **Description** | Creates or updates Business Applications from the cloud accounts that carry a tag, one per cloud provider. |
+| **Description** | For each value of a tag key, creates or updates a Business Application (one per cloud provider) and an asset group named after the value. |
 
 ### Input Arguments
 
 | Argument | Type | Required | Default | Description |
 |----------|------|----------|---------|-------------|
-| `application_name` | String | Yes | — | Application name (name prefix when accounts span several providers) |
-| `tag_key` | String | Yes | — | Tag key to look for |
-| `tag_value` | Array | No | — | Tag values to match (any of them). If empty, any value matches |
+| `tag_key` | String | Yes | — | Tag key whose values name the applications and asset groups |
 | `cloud_provider` | Array | No | — | `AWS`, `Azure`, `GCP` (case-insensitive). If empty, all providers are scanned |
-| `case_sensitive` | Boolean | No | `false` | Case-sensitive tag key/value matching |
+| `case_sensitive` | Boolean | No | `false` | Case-sensitive tag key matching and value grouping (see above) |
 | `business_criticality` | String | No | `Medium` on create | `Critical`, `High`, `Medium` or `Low`. On update, only changed when provided |
 | `description` | String | No | — | Application description |
 | `business_unit` | String | No | — | Business unit |
-| `compliance` | String | No | — | `PCI-DSS`, `ISO 27001`, `SOX`, `NIST`, `GDPR`, `CCPA`, `HIPAA` or `FedRAMP` |
-| `business_owner` | Array | No | — | Business owners |
-| `dev_owner` | Array | No | — | Development owners |
-| `devops_owner` | Array | No | — | DevOps owners |
-| `product_manager` | Array | No | — | Product managers |
-| `recreate_on_change` | Boolean | No | `false` | Delete and recreate when the accounts changed (see above) |
+| `compliance` | Array | No | — | One or more of `PCI-DSS`, `ISO 27001`, `SOX`, `NIST`, `GDPR`, `CCPA`, `HIPAA`, `FedRAMP` |
+| `business_owner` | Array | No | — | Business owners (`businessOwner`): user emails or team identifiers |
+| `group_description` | String | No | `Dynamic asset group created by automation script` | Asset group description |
+| `core_api_instance` | String | No | — | Core REST API integration instance to use (recommended when there is more than one — see below) |
+| `xql_instance` | String | No | — | XQL Query Engine integration instance to use |
+| `recreate_on_change` | Boolean | No | `true` | Delete and recreate when the accounts changed (see above). Set to `false` to only update metadata |
 | `dry_run` | Boolean | No | `false` | Only show what would be done (includes the debug info) |
 | `debug` | Boolean | No | `false` | Show the API requests and responses in output |
 
-> **Important:** Enable **"Is array"** for `tag_value`, `cloud_provider` and the four owner arguments.
+> **Important:** Enable **"Is array"** for `cloud_provider`, `compliance` and `business_owner`.
+>
+> The application metadata arguments apply to every application the run creates or updates.
 >
 > Metadata arguments that are left empty are never sent, so an update doesn't blank out existing values.
 
 ### Output
 
-One context entry per application:
-
 | Context Path | Type | Description |
 |--------------|------|-------------|
-| `CreateApplication.application_id` | String | The application ID (new ID when recreated) |
-| `CreateApplication.application_name` | String | The application name |
-| `CreateApplication.provider` | String | `AWS`, `AZURE` or `GCP` |
-| `CreateApplication.action` | String | `created`, `updated`, `recreated`, `unchanged` (exists, no metadata to update) or `failed`; `would be ...` in dry run |
-| `CreateApplication.account_ids` | List | Tagged accounts for this provider |
-| `CreateApplication.account_count` | Number | Number of tagged accounts for this provider |
-| `CreateApplication.accounts_changed` | Boolean | Whether they differ from the existing application's selection |
-| `CreateApplication.accounts_added` | List | Tagged accounts missing from the existing application (before this run) |
-| `CreateApplication.accounts_removed` | List | Accounts in the existing application that are no longer tagged (before this run) |
-| `CreateApplication.status` | String | `success`, `warning`, `failed` or `dry_run` |
-| `CreateApplication.message` | String | Warning or error text, if any |
+| `CreateApplication.tag_key` | String | The tag key used |
+| `CreateApplication.applications` | List | One entry per application (fields below) |
+| `CreateApplication.asset_groups` | List | One entry per tag value (fields below) |
+| `CreateApplication.empty_value_accounts` | List | Accounts with the tag key but an empty value (ignored) |
+| `CreateApplication.failed_lookups` | List | Accounts whose tags could not be parsed (ignored) |
 
-One application failing doesn't stop the others; the script only returns an error when all of them failed. If no account matches the tag, nothing is created and the output says so.
+`applications` entries:
+
+| Field | Description |
+|-------|-------------|
+| `tag_value` | The tag value this application was built from |
+| `application_id` | The application ID (new ID when recreated) |
+| `application_name` | The application name |
+| `provider` | `AWS`, `AZURE` or `GCP` |
+| `action` | `created`, `updated`, `recreated`, `unchanged` (exists, no metadata to update) or `failed`; `would be ...` in dry run |
+| `account_ids` / `account_count` | Tagged accounts for this value and provider |
+| `accounts_changed` | Whether they differ from the existing application's selection |
+| `accounts_added` | Tagged accounts missing from the existing application (before this run) |
+| `accounts_removed` | Accounts in the existing application that no longer have this value (before this run) |
+| `status` | `success`, `warning`, `failed` or `dry_run` |
+| `message` | Warning or error text, if any |
+
+`asset_groups` entries: `tag_value`, `group_id`, `group_name`, `action` (`created`, `updated`, `failed`; `would be ...` in dry run), `account_ids`, `account_count`, `status`, `message`.
+
+One application or asset group failing doesn't stop the others; the script only returns an error when all of them failed. If no account has a non-empty value for the tag key, nothing is created and the output says so.
+
+The script stops itself after `SCRIPT_TIMEOUT_SECONDS` (300s) and returns what it handled so far, with a note; run it again to finish. Keep the script timeout in Cortex above that value.
 
 ---
 
@@ -357,9 +387,10 @@ Both account-selection scripts feed the same `CreateAssetGroup` script; pick whi
 - If it fails with `xdr-xql-generic-query: ...`, check that the Cortex XDR - XQL Query Engine integration is enabled
 
 ### CreateApplication fails or doesn't apply the new accounts
-- Run with `dry_run=true` first: it shows, per provider, the application name, the action and the asset selection that would be sent
-- No application created and *"No accounts matched the tag"*: the tag lookup is the same as `GetCloudAccountsByTag`'s — see [GetCloudAccountsByTag returns no results](#getcloudaccountsbytag-returns-no-results); the XQL query is in the debug output
-- `action: updated` / `unchanged` with a warning about the account selection: the update API can't change the accounts; re-run with `recreate_on_change=true`
+- **Several Core REST API / XQL instances** (e.g. one per tenant): without `using`, each command runs on **every** instance and returns one entry per instance — typically errors (401/403/500) from the other tenants and a success from the right one. The script ignores the errors when one instance succeeds (they are listed in the debug output as `ignored error from <instance>`). If **more than one** instance succeeds, the output warns: a create/delete may then have changed several tenants. Set `core_api_instance` and `xql_instance` to the instance names (Settings → Integrations) to pin the calls to one tenant
+- Run with `dry_run=true` first: it shows, per tag value and provider, the application name, the action and the asset selection that would be sent, plus the asset groups that would be created/updated
+- Nothing created and *"No account has a non-empty ... tag"*: the tag lookup is the same as `GetCloudAccountsByTag`'s — see [GetCloudAccountsByTag returns no results](#getcloudaccountsbytag-returns-no-results); the XQL query is in the debug output
+- `action: updated` / `unchanged` with a warning about the account selection: the update API can't change the accounts; the run had `recreate_on_change=false`; re-run with `true` (the default)
 - If it fails with the generic *"failed to run script with default configuration"*, run the XQL query and the `core-api-*` calls (see `debug=true`) directly in the War Room to see the real error
 - `core-api-put` / `core-api-delete` must be available (Core REST API integration) for updates and recreates
 
@@ -377,6 +408,6 @@ Both account-selection scripts feed the same `CreateAssetGroup` script; pick whi
 | `GetCloudAccounts.py` | Script to retrieve cloud account IDs filtered by account name |
 | `GetCloudAccountsByTag.py` | Script to retrieve cloud account IDs filtered by tag key/value |
 | `CreateAssetGroup.py` | Script to create/update dynamic asset groups (via `getAssetGroup` / `createAssetGroup` / `setAssetGroup`) |
-| `CreateApplication.py` | Script to create/update AppSec Business Applications from tagged accounts, one per provider |
+| `CreateApplication.py` | Script to create/update, per tag value, AppSec Business Applications (one per provider) and an asset group |
 | `cortex-apis-docs.md` | Reference documentation for Cortex platform APIs |
 | `cortex-cloud-onboarding-apis-docs.md` | Reference documentation for Cloud Onboarding APIs |
