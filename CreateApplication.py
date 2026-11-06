@@ -1,0 +1,1195 @@
+"""CreateApplication - Cortex Cloud Script
+
+Creates or updates one Business Application (AppSec) and one asset group per
+value of a given tag key, from the cloud accounts that carry that key. The tag
+value is used as the name. Existing applications / asset groups with the same
+name are updated; otherwise, new ones are created.
+
+Accounts are found with a single XQL query on the asset_inventory dataset
+(xdr-xql-generic-query, from the Cortex XDR - XQL Query Engine integration,
+which must be enabled). Each provider keeps its tags in a different place
+inside xdm.asset.raw_fields; the query extracts all of them in one pass (see
+XQL_QUERY_TEMPLATE):
+    - AWS:   "Platform Discovery".Tags   -> list of {"Key","Value"} (tags_aws),
+             converted to {key: value} here
+    - Azure: "Platform Discovery".tags   -> JSON object (tags_azure)
+    - GCP:   "Platform Discovery".labels -> JSON object (tags_gcp)
+The accounts are then grouped by the value of tag_key, here. This is the same
+lookup as the GetCloudAccountsByTag script, embedded so this script has no
+dependency on it.
+
+For each tag value:
+    - Business Application(s). An application's asset filter takes a single
+      provider, so the value's accounts are grouped by provider (AWS, AZURE, GCP):
+          one provider found: one application, named exactly <tag value>
+          several found:      one application per provider, named
+                              "<tag value> - <PROVIDER>" (APP_NAME_FORMAT)
+    - Asset group: one dynamic group named <tag value>, with the value's
+      accounts from every provider. Created after all the applications.
+
+Accounts whose tag has an empty value are ignored (there is no name to give
+them); the output says how many.
+
+Applications use the AppSec Applications API via the Core REST API commands:
+    - GET    /public_api/appsec/v1/application        (core-api-get, paginated)
+    - POST   /public_api/appsec/v1/application        (core-api-post)
+    - PUT    /public_api/appsec/v1/application/{id}   (core-api-put)
+    - DELETE /public_api/appsec/v1/application/{id}   (core-api-delete)
+Each application selects its assets with a "run" section ACCOUNT filter:
+    {"selectionType": "filter", "section": "run",
+     "filter": {"filterType": "ACCOUNT", "values": [...], "provider": "AWS"}}
+
+Asset groups use the platform's native commands (same as CreateAssetGroup):
+    - getAssetGroup / createAssetGroup / setAssetGroup
+with a membership filter matching xdm.asset.realm against every account (OR).
+
+LIMITATION: the application update API (PUT) only accepts metadata
+(criticality, owners, description...) - NOT the asset selection. So an
+application's account list is only set when it is created. When it differs
+from the existing one:
+    - recreate_on_change=true (default): the application is deleted and created again
+      with the new accounts. Its metadata (criticality, owners...) is carried
+      over, but it gets a NEW application ID, and manual asset overrides are lost.
+      If the create fails after the delete, the application is gone - use
+      dry_run first.
+    - recreate_on_change=false: metadata is updated and a warning is
+      returned; the existing account selection is left as is.
+Asset groups don't have this limitation: their membership is always updated.
+
+Arguments:
+    tag_key (str): Required. Tag key whose values name the applications/groups.
+    cloud_provider (list): Optional. AWS, Azure, GCP (case-insensitive). When
+        empty, all providers are scanned.
+    case_sensitive (bool): Optional. Default: false. Applies to the tag key
+        and to grouping the values: when false, "Billing" and "billing" are
+        the same value, named after the first spelling found.
+    business_criticality (str): Optional. Critical, High, Medium or Low.
+        Default on create: Medium. On update, only changed when provided.
+    description (str): Optional. Application description.
+    business_unit (str): Optional.
+    compliance (list): Optional. One or more of PCI-DSS, ISO 27001, SOX, NIST,
+        GDPR, CCPA, HIPAA, FedRAMP.
+    business_owner (list): Optional. User emails or team identifiers.
+        Application metadata arguments apply to every application.
+    group_description (str): Optional. Asset group description.
+    core_api_instance (str): Optional. Name of the Core REST API integration
+        instance to use. Recommended when there is more than one: without it,
+        each core-api-* command runs on EVERY instance - a create/delete can
+        then change several tenants. Errors from the other instances are
+        ignored when one succeeds (they are listed in the debug output).
+    xql_instance (str): Optional. Name of the XQL Query Engine integration
+        instance to use (same reason).
+    recreate_on_change (bool): Optional. See LIMITATION above. Default: true.
+    dry_run (bool): Optional. Preview changes without executing them.
+    debug (bool): Optional. Show the API requests and responses in output.
+
+Output:
+    Context path: CreateApplication
+        - tag_key: The tag key used
+        - applications: One entry per application
+            - tag_value, application_id, application_name, provider
+            - action: created/updated/recreated/unchanged/failed (or "would be
+              ..." in dry run). "unchanged" = the application exists and no
+              metadata arguments were provided, so there was nothing the API
+              could update.
+            - account_ids / account_count: Accounts found for this provider
+            - accounts_changed: Whether they differ from the existing application's
+            - accounts_added / accounts_removed: Found accounts missing from /
+              extra in the existing application's selection (before this run)
+            - status: success/warning/failed/dry_run
+            - message: Warning or error text, if any
+        - asset_groups: One entry per tag value
+            - tag_value, group_id, group_name, action (created/updated/failed
+              or "would be ..."), account_ids, account_count, status, message
+        - empty_value_accounts: Accounts with the tag key but an empty value (ignored)
+        - failed_lookups: Accounts whose tags could not be parsed (ignored)
+"""
+
+import traceback
+import json
+import time
+
+
+# =============================================================================
+# CONSTANTS
+# =============================================================================
+
+# The script stops itself (with its debug info and the work done so far) after
+# this long, so it reports what happened instead of being killed by the
+# platform. Keep the script timeout in Cortex above it.
+SCRIPT_TIMEOUT_SECONDS = 300
+SCRIPT_STARTED = time.time()
+
+XQL_COMMAND = "xdr-xql-generic-query"
+XQL_RESULTS_COMMAND = "xdr-xql-get-query-results"  # used only if the query is still pending
+XQL_QUERY_NAME = "CreateApplication"
+XQL_TIME_FRAME = "7 days"
+XQL_TIMEOUT_SECONDS = 300
+XQL_POLL_INTERVAL_SECONDS = 10
+
+XQL_STATUS_DONE = ("SUCCESS", "PARTIAL_SUCCESS")
+XQL_STATUS_PENDING = ("PENDING",)
+
+# Asset type scanned per cloud provider. Keys are the (lowercase) values accepted
+# by the cloud_provider argument and returned in the query's cloud_provider column.
+ASSET_TYPE_BY_PROVIDER = {
+    "aws": "AWS Account",
+    "azure": "Azure Subscription",
+    "gcp": "GCP Project",
+}
+
+# Query column holding each provider's tags
+TAGS_COLUMN_BY_PROVIDER = {
+    "aws": "tags_aws",
+    "azure": "tags_azure",
+    "gcp": "tags_gcp",
+}
+
+# {asset_types} is replaced with the quoted, comma-separated asset type names
+XQL_QUERY_TEMPLATE = """dataset = asset_inventory
+| filter xdm.asset.type.name in ({asset_types})
+| alter cloud_provider = if(xdm.asset.type.name = "AWS Account", "aws",
+                         if(xdm.asset.type.name = "Azure Subscription", "azure", "gcp"))
+| alter tags_aws   = json_extract_array(xdm.asset.raw_fields, "$.Platform Discovery.Tags"),
+        tags_azure = json_extract(xdm.asset.raw_fields, "$.Platform Discovery.tags"),
+        tags_gcp   = json_extract(xdm.asset.raw_fields, "$.Platform Discovery.labels")
+| fields cloud_provider, xdm.asset.cloud.account.id as account_id, xdm.asset.name as account_name,
+         tags_aws, tags_azure, tags_gcp
+| sort asc cloud_provider, asc account_id"""
+
+API_APPLICATIONS = "/public_api/appsec/v1/application"
+API_APPLICATION = "/public_api/appsec/v1/application/{app_id}"
+
+PAGE_SIZE = 100
+FIRST_PAGE = 1     # Pages start at 1 per the AppSec API docs
+MAX_PAGES = 1000   # Safety net against runaway pagination
+
+# Name used per provider when a tag value's accounts span more than one provider
+APP_NAME_FORMAT = "{name} - {provider}"
+
+CREATION_TYPE = "Manual"
+DEFAULT_CRITICALITY = "Medium"
+SECTION = "run"
+SELECTION_TYPE = "filter"
+FILTER_TYPE = "ACCOUNT"
+
+# Asset group commands (the same ones CreateAssetGroup uses)
+CMD_GET_GROUP = "getAssetGroup"
+CMD_CREATE_GROUP = "createAssetGroup"
+CMD_UPDATE_GROUP = "setAssetGroup"
+GROUP_TYPE = "Dynamic"
+DEFAULT_GROUP_DESCRIPTION = "Dynamic asset group created by automation script"
+
+# Field names that may hold the group ID / name in the command results, checked
+# case-insensitively and in this order (the output shape isn't documented).
+GROUP_ID_KEYS = ("xdm.asset_group.id", "asset_group_id", "group_id", "id")
+GROUP_NAME_KEYS = ("xdm.asset_group.name", "group_name", "name")
+# For the create result, a bare "id" is too generic to trust - if none of these
+# is found, the new group is looked up by name instead.
+CREATED_GROUP_ID_KEYS = ("xdm.asset_group.id", "asset_group_id", "group_id")
+
+# Accepted values, keyed by lowercase input -> value sent to the API.
+# PROVIDERS keys match ASSET_TYPE_BY_PROVIDER's.
+PROVIDERS = {p.lower(): p for p in ("AWS", "AZURE", "GCP")}
+CRITICALITIES = {c.lower(): c for c in ("Critical", "High", "Medium", "Low")}
+COMPLIANCES = {c.lower(): c for c in (
+    "PCI-DSS", "ISO 27001", "SOX", "NIST", "GDPR", "CCPA", "HIPAA", "FedRAMP"
+)}
+
+# Script argument -> API field, for the list-valued owner fields
+OWNER_FIELDS = {
+    "business_owner": "businessOwner",
+}
+
+
+# Integration instances to run the commands on (set from the core_api_instance
+# and xql_instance arguments); None = let the platform run them on every instance
+CORE_API_INSTANCE = None
+XQL_INSTANCE = None
+
+# Commands that got a successful answer from more than one instance - reported
+# in the output, since a write may then have changed several tenants
+MULTI_INSTANCE_COMMANDS = {}
+
+
+class ScriptTimeout(DemistoException):
+    """Raised when the script has run longer than SCRIPT_TIMEOUT_SECONDS."""
+
+
+# =============================================================================
+# LOGGING, TIMEOUT AND API CALLS
+# =============================================================================
+
+def log(debug_info: list, line: str) -> None:
+    """Add a line to debug_info, prefixed with the elapsed time, and to the script log."""
+    line = f"[{time.time() - SCRIPT_STARTED:6.1f}s] {line}"
+    debug_info.append(line)
+    demisto.debug(f"CreateApplication {line}")
+
+
+def check_timeout(stage: str) -> None:
+    """Raise ScriptTimeout when the script has run longer than SCRIPT_TIMEOUT_SECONDS."""
+    elapsed = time.time() - SCRIPT_STARTED
+    if elapsed > SCRIPT_TIMEOUT_SECONDS:
+        raise ScriptTimeout(f"Stopped during {stage}: {elapsed:.0f}s elapsed, over the "
+                            f"{SCRIPT_TIMEOUT_SECONDS}s timeout (SCRIPT_TIMEOUT_SECONDS)")
+
+
+def with_instance(args: dict, instance: str | None) -> dict:
+    """Add the "using" argument, which pins a command to one integration instance."""
+    return {**args, "using": instance} if instance else args
+
+
+def entry_instance(entry: dict) -> str:
+    """Name of the integration instance that produced a command result entry."""
+    return str(entry.get("ModuleName") or entry.get("Brand") or "unknown instance")
+
+
+def log_instance_results(command: str, errors: list, successes: list, debug_info: list) -> None:
+    """
+    Log the error entries that were ignored and record when more than one
+    instance answered successfully.
+
+    When a command runs on several integration instances (one per tenant),
+    each one returns its own entry: errors from the others are expected and
+    ignored as long as one succeeded.
+    """
+    for entry in errors:
+        log(debug_info, f"  ignored error from {entry_instance(entry)}: {str(entry.get('Contents'))[:300]}")
+    if len(successes) > 1:
+        instances = [entry_instance(e) for e in successes]
+        MULTI_INSTANCE_COMMANDS[command] = instances
+        log(debug_info, f"  WARNING: {len(successes)} instances answered successfully: "
+                        f"{', '.join(instances)} - using the first one")
+
+
+def parse_api_response(result: list, operation: str, command: str, debug_info: list):
+    """
+    Return the response body from a core-api-* command result.
+
+    The AppSec API returns its body directly (not wrapped in 'reply' like the
+    v1 public APIs), so 'reply' is unwrapped only when present. Error entries
+    (Type 4) - e.g. from other Core REST API instances pointing to other
+    tenants - are ignored when a valid entry is found; the first valid one is used.
+
+    Raises:
+        DemistoException: If no valid response is found
+    """
+    if not result:
+        raise DemistoException(f"{operation}: Empty response from API")
+
+    errors = []
+    successes = []
+    for entry in result:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("Type") == 4:
+            errors.append(entry)
+            continue
+        contents = entry.get("Contents", {})
+        response = contents.get("response") if isinstance(contents, dict) else None
+        if response is not None:
+            successes.append((entry, response))
+
+    log_instance_results(command, errors, [e for e, _ in successes], debug_info)
+    if successes:
+        response = successes[0][1]
+        if isinstance(response, dict) and "reply" in response:
+            return response["reply"]
+        return response
+
+    error_msg = get_error(result) if is_error(result) else "No valid response found"
+    raise DemistoException(f"{operation}: {error_msg}")
+
+
+def call_api(command: str, uri: str, operation: str, debug_info: list, body: dict = None):
+    """Run a core-api-* command, log it to debug_info and return the parsed body."""
+    args = {"uri": uri}
+    if body is not None:
+        args["body"] = json.dumps(body)
+    log(debug_info, f"{command} {uri}" + (f"\n  body: {args['body']}" if body is not None else ""))
+
+    result = demisto.executeCommand(command, with_instance(args, CORE_API_INSTANCE))
+    response = parse_api_response(result, operation, command, debug_info)
+    log(debug_info, f"  response: {json.dumps(response, default=str)[:2000]}")
+    return response
+
+
+def run_command(command: str, args: dict, debug_info: list) -> list:
+    """
+    Run a platform command and return its non-error entries.
+
+    The platform may return an error entry (Type 4) ahead of the valid one,
+    so error entries are skipped; the command only fails if nothing else
+    came back.
+    """
+    log(debug_info, f"{command} args: {json.dumps(args)}")
+    result = demisto.executeCommand(command, args) or []
+    log(debug_info, f"  result: {json.dumps(result, default=str)[:2000]}")
+
+    entries = [e for e in result if isinstance(e, dict) and e.get("Type") != 4]
+    if not entries:
+        error_msg = get_error(result) if is_error(result) else "Empty response"
+        raise DemistoException(f"{command} failed: {error_msg}")
+    return entries
+
+
+# =============================================================================
+# ARGUMENT HELPERS
+# =============================================================================
+
+def normalize_choice(value: str, choices: dict, arg_name: str) -> str | None:
+    """
+    Map a case-insensitive argument value to its canonical API value.
+
+    Returns None for an empty value; raises ValueError for an unknown one.
+    """
+    if not value:
+        return None
+    canonical = choices.get(value.strip().lower())
+    if canonical is None:
+        raise ValueError(f"Invalid {arg_name}: {value}. Valid values: {', '.join(choices.values())}")
+    return canonical
+
+
+def unique(values: list) -> list:
+    """Return the non-empty values, stripped and deduplicated, preserving order."""
+    seen = set()
+    result = []
+    for value in values:
+        value = str(value).strip()
+        if value and value not in seen:
+            seen.add(value)
+            result.append(value)
+    return result
+
+
+def build_metadata(args: dict) -> dict:
+    """
+    Build the application metadata fields accepted by both create and update.
+
+    Only arguments that were actually provided are included, so an update
+    never blanks out existing values.
+    """
+    metadata = {}
+
+    criticality = normalize_choice(args.get("business_criticality"), CRITICALITIES, "business_criticality")
+    if criticality:
+        metadata["businessCriticality"] = criticality
+
+    # The API takes compliance as an array of values
+    compliance = unique(normalize_choice(c, COMPLIANCES, "compliance")
+                        for c in argToList(args.get("compliance")) if str(c).strip())
+    if compliance:
+        metadata["compliance"] = compliance
+
+    if args.get("description"):
+        metadata["description"] = args["description"]
+    if args.get("business_unit"):
+        metadata["businessUnit"] = args["business_unit"]
+
+    for arg_name, field in OWNER_FIELDS.items():
+        owners = unique(argToList(args.get(arg_name)))
+        if owners:
+            metadata[field] = owners
+
+    return metadata
+
+
+def existing_metadata(app: dict) -> dict:
+    """
+    Return the metadata fields of an existing application, so a recreated
+    application keeps them (arguments provided on this run override them).
+
+    Only fields the create API accepts are copied: an unknown field would
+    fail the create AFTER the delete.
+    """
+    fields = ("businessCriticality", "compliance", "description", "businessUnit",
+              *OWNER_FIELDS.values())
+    metadata = {f: app[f] for f in fields if app.get(f) not in (None, "", [], {})}
+    # The list/GET responses return compliance as a single value, but create
+    # expects an array - sending it as is would fail the create AFTER the delete
+    if isinstance(metadata.get("compliance"), str):
+        metadata["compliance"] = [metadata["compliance"]]
+    return metadata
+
+
+def build_asset_selection(account_ids: list, provider: str) -> dict:
+    """Build the "run" section ACCOUNT filter that selects the application's assets."""
+    return {
+        "selectionType": SELECTION_TYPE,
+        "section": SECTION,
+        "filter": {"filterType": FILTER_TYPE, "values": account_ids, "provider": provider},
+    }
+
+
+# =============================================================================
+# ACCOUNT LOOKUP (XQL query on asset_inventory)
+# =============================================================================
+
+def resolve_providers(cloud_providers: list) -> list:
+    """
+    Map the cloud_provider argument (case-insensitive) to provider keys.
+
+    An empty list means every provider. Unknown providers raise a ValueError
+    rather than being silently ignored, so a typo can't shrink the scan.
+    """
+    if not cloud_providers:
+        return list(ASSET_TYPE_BY_PROVIDER)
+
+    providers = []
+    unknown = []
+    for provider in cloud_providers:
+        key = provider.lower()
+        if key not in ASSET_TYPE_BY_PROVIDER:
+            unknown.append(provider)
+        elif key not in providers:
+            providers.append(key)
+
+    if unknown:
+        raise ValueError(
+            f"Unknown cloud_provider: {', '.join(unknown)}. "
+            f"Valid values (case-insensitive): {', '.join(ASSET_TYPE_BY_PROVIDER)}"
+        )
+    return providers
+
+
+def build_query(providers: list) -> str:
+    """Build the XQL query, scanning only the given providers' asset types."""
+    asset_types = ", ".join(f'"{ASSET_TYPE_BY_PROVIDER[p]}"' for p in providers)
+    return XQL_QUERY_TEMPLATE.format(asset_types=asset_types)
+
+
+def iter_records(data):
+    """Yield every dict nested anywhere inside data (lists and dicts)."""
+    if isinstance(data, list):
+        for item in data:
+            yield from iter_records(item)
+    elif isinstance(data, dict):
+        yield data
+        for value in data.values():
+            if isinstance(value, (dict, list)):
+                yield from iter_records(value)
+
+
+def find_query_data(result: list, operation: str, debug_info: list) -> dict:
+    """
+    Return the query status object ({status, execution_id, results, ...}) from
+    an XQL command result.
+
+    It is looked for in Contents and EntryContext, since its exact location
+    isn't documented. Error entries (Type 4) - e.g. from other instances - are
+    ignored when a valid entry is found; the first valid one is used.
+    """
+    errors = []
+    found = []
+    for entry in result or []:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("Type") == 4:
+            errors.append(entry)
+            continue
+        record = next((r for data in (entry.get("Contents"), entry.get("EntryContext"))
+                       for r in iter_records(data)
+                       if "status" in r and ("results" in r or "execution_id" in r)), None)
+        if record is not None:
+            found.append((entry, record))
+
+    log_instance_results(operation, errors, [e for e, _ in found], debug_info)
+    if found:
+        return found[0][1]
+
+    error_msg = get_error(result) if is_error(result) else "No query results found"
+    raise DemistoException(f"{operation}: {error_msg}")
+
+
+def run_query(query: str, debug_info: list) -> tuple:
+    """
+    Run the XQL query and return (rows, warning).
+
+    When the command returns while the query is still pending, its results are
+    polled with xdr-xql-get-query-results until done or XQL_TIMEOUT_SECONDS.
+    warning is set when the query reports more results than it returned.
+    """
+    log(debug_info, f"{XQL_COMMAND} - XQL query:\n{query}")
+    result = demisto.executeCommand(XQL_COMMAND, with_instance({
+        "query": query,
+        "time_frame": XQL_TIME_FRAME,
+        "query_name": XQL_QUERY_NAME,
+    }, XQL_INSTANCE))
+    data = find_query_data(result, XQL_COMMAND, debug_info)
+    log(debug_info, f"{XQL_COMMAND} returned status {data.get('status')}")
+
+    deadline = time.time() + XQL_TIMEOUT_SECONDS
+    while str(data.get("status")).upper() in XQL_STATUS_PENDING:
+        execution_id = data.get("execution_id")
+        if not execution_id:
+            raise DemistoException("XQL query is pending but returned no execution_id to poll")
+        if time.time() > deadline:
+            raise DemistoException(f"XQL query {execution_id} still pending after {XQL_TIMEOUT_SECONDS}s")
+        check_timeout(f"XQL query {execution_id} (still pending)")
+        log(debug_info, f"Query {execution_id} pending, polling again in {XQL_POLL_INTERVAL_SECONDS}s")
+        time.sleep(XQL_POLL_INTERVAL_SECONDS)  # noqa: polling an async query
+        result = demisto.executeCommand(XQL_RESULTS_COMMAND,
+                                        with_instance({"query_id": execution_id}, XQL_INSTANCE))
+        data = find_query_data(result, XQL_RESULTS_COMMAND, debug_info)
+
+    status = str(data.get("status")).upper()
+    if status not in XQL_STATUS_DONE:
+        raise DemistoException(f"XQL query failed with status {status}: {data.get('error') or ''}")
+
+    rows = [r for r in (data.get("results") or []) if isinstance(r, dict)]
+    reported = data.get("number_of_results")
+    debug_info.append(f"Query status: {status}, rows returned: {len(rows)}, number_of_results: {reported}")
+
+    warning = None
+    if isinstance(reported, int) and reported > len(rows):
+        warning = (f"The query reported {reported} results but only {len(rows)} were returned - "
+                   f"the account list may be incomplete.")
+    return rows, warning
+
+
+def parse_tags(raw) -> dict:
+    """
+    Return a row's tags as a {key: value} dict.
+
+    Azure and GCP tags are a {key: value} object; AWS tags are a list of
+    {"Key", "Value"}. Either may arrive already parsed or as a JSON string (and
+    AWS list items as JSON strings too). An empty value means no tags. Raises
+    ValueError when the value can't be parsed.
+    """
+    if raw in (None, "", "null"):
+        return {}
+    tags = json.loads(raw) if isinstance(raw, str) else raw
+    if tags is None:
+        return {}
+    if isinstance(tags, dict):
+        return tags
+    if not isinstance(tags, list):
+        raise ValueError(f"expected a JSON object or list, got {type(tags).__name__}")
+
+    normalized = {}
+    for item in tags:
+        if isinstance(item, str):
+            item = json.loads(item)
+        if not isinstance(item, dict) or "Key" not in item:
+            raise ValueError(f"unexpected tag item: {item!r}")
+        value = item.get("Value")
+        normalized[str(item["Key"])] = "" if value is None else value
+    return normalized
+
+
+def tag_values_for(tags: dict, tag_key: str, case_sensitive: bool) -> list | None:
+    """
+    Return the (stripped) values of tag_key in tags, or None when the key is absent.
+
+    A list, because with case_sensitive=false several keys may match (e.g.
+    "App" and "app"). Empty values are kept as "" so the caller can count them.
+    """
+    def norm(text: str) -> str:
+        return text if case_sensitive else text.lower()
+
+    wanted = norm(tag_key)
+    values = [str(v).strip() if v is not None else "" for k, v in tags.items() if norm(str(k)) == wanted]
+    return values or None
+
+
+def find_tagged_accounts(providers: list, tag_key: str, case_sensitive: bool, debug_info: list) -> dict:
+    """
+    Run the XQL query and group the accounts carrying tag_key by its value.
+
+    Returns a dict with:
+        groups: {tag value: {provider: unique account IDs}}, values sorted,
+            providers in AWS/AZURE/GCP order. With case_sensitive=false,
+            values differing only in case are merged under the first spelling found.
+        variants: {tag value: all spellings merged into it}, only for merged values
+        empty_value_ids: accounts that have tag_key with an empty value (ignored)
+        failed_ids: accounts whose tags couldn't be parsed (ignored)
+        warning: the query's incomplete-results warning, or None
+        row_count: number of rows the query returned
+    """
+    rows, warning = run_query(build_query(providers), debug_info)
+
+    names = {}        # normalized value -> display name (first spelling found)
+    spellings = {}    # normalized value -> every spelling found
+    matched = {}      # normalized value -> {provider key: [account IDs]}
+    empty_value_ids = []
+    failed = []
+
+    for row in rows:
+        provider = str(row.get("cloud_provider") or "").lower()
+        column = TAGS_COLUMN_BY_PROVIDER.get(provider)
+        if column is None:
+            failed.append((row, f"unknown cloud_provider {provider!r}"))
+            continue
+        try:
+            tags = parse_tags(row.get(column))
+        except ValueError as ex:  # json.JSONDecodeError is a ValueError
+            failed.append((row, f"could not parse {column}: {ex}"))
+            continue
+
+        account_id = row.get("account_id")
+        values = tag_values_for(tags, tag_key, case_sensitive)
+        if not account_id or values is None:
+            continue
+
+        if not any(values):
+            empty_value_ids.append(str(account_id))
+            continue
+        for value in unique(values):
+            key = value if case_sensitive else value.lower()
+            names.setdefault(key, value)
+            spellings.setdefault(key, [])
+            if value not in spellings[key]:
+                spellings[key].append(value)
+            matched.setdefault(key, {}).setdefault(provider, []).append(str(account_id))
+
+    groups = {}
+    variants = {}
+    for key in sorted(names, key=lambda k: names[k].lower()):
+        by_provider = matched[key]
+        groups[names[key]] = {PROVIDERS[p]: unique(by_provider[p]) for p in PROVIDERS if p in by_provider}
+        if len(spellings[key]) > 1:
+            variants[names[key]] = spellings[key]
+
+    debug_info.append(f"Tagged accounts by value and provider: {json.dumps(groups)}")
+    if empty_value_ids:
+        debug_info.append(f"Accounts with an empty {tag_key} value (ignored): {', '.join(empty_value_ids)}")
+    if failed:
+        sample = "\n".join(f"  {r.get('account_id')}: {err}" for r, err in failed[:20])
+        debug_info.append(f"Rows whose tags could not be parsed (first 20):\n{sample}")
+
+    return {
+        "groups": groups,
+        "variants": variants,
+        "empty_value_ids": unique(empty_value_ids),
+        "failed_ids": [r.get("account_id") for r, _ in failed],
+        "warning": warning,
+        "row_count": len(rows),
+    }
+
+
+def application_names(base_name: str, providers: list) -> dict:
+    """Return {provider: application name}: the base name alone for a single provider."""
+    if len(providers) == 1:
+        return {providers[0]: base_name}
+    return {p: APP_NAME_FORMAT.format(name=base_name, provider=p) for p in providers}
+
+
+# =============================================================================
+# APPLICATIONS
+# =============================================================================
+
+def list_applications(debug_info: list) -> dict:
+    """
+    Return every application, keyed by name.
+
+    The list API has no name filter, so all pages are read (once) and the
+    applications are matched by name locally.
+    """
+    apps = {}
+    seen_ids = set()
+    for page in range(FIRST_PAGE, FIRST_PAGE + MAX_PAGES):
+        check_timeout(f"list applications (page {page}, {len(apps)} applications so far)")
+        uri = f"{API_APPLICATIONS}?page={page}&pageSize={PAGE_SIZE}"
+        response = call_api("core-api-get", uri, "List applications", debug_info)
+
+        data = response.get("data", []) if isinstance(response, dict) else response or []
+        page_ids = {app.get("id") for app in data if isinstance(app, dict)}
+        new_ids = page_ids - seen_ids
+        seen_ids |= page_ids
+        for app in data:
+            if isinstance(app, dict) and app.get("name"):
+                apps[app["name"]] = app
+
+        has_next = response.get("hasNext") if isinstance(response, dict) else None
+        log(debug_info, f"page {page}: {len(data)} applications ({len(new_ids)} new), hasNext={has_next}")
+
+        if not isinstance(response, dict) or not has_next or not data:
+            return apps
+        if not new_ids:
+            # The API keeps answering with applications already seen - the page
+            # parameter is probably ignored, so going on would loop until timeout
+            log(debug_info, f"WARNING: page {page} only returned applications already seen - "
+                            f"stopping pagination (hasNext is still {has_next})")
+            return apps
+
+    log(debug_info, f"WARNING: stopped after reaching MAX_PAGES ({MAX_PAGES})")
+    return apps
+
+
+def get_current_selection(app: dict) -> tuple:
+    """
+    Return (account_ids, provider) of an existing application's ACCOUNT filter.
+
+    Returns (None, None) when the application doesn't select assets by
+    account (e.g. it was built from code repositories or in the UI with
+    another filter), in which case it can't be compared.
+    """
+    selection = (app.get("config") or {}).get("assetSelection") or {}
+    selection_filter = selection.get("filter")
+    if (selection.get("section") != SECTION
+            or not isinstance(selection_filter, dict)
+            or selection_filter.get("filterType") != FILTER_TYPE):
+        return None, None
+    return unique(selection_filter.get("values") or []), selection_filter.get("provider")
+
+
+def create_application(app_name: str, metadata: dict, account_ids: list, provider: str,
+                       debug_info: list) -> str | None:
+    """Create the application and return its ID."""
+    body = {
+        "name": app_name,
+        "creationType": CREATION_TYPE,
+        "businessCriticality": DEFAULT_CRITICALITY,
+        **metadata,
+        "assetSelection": build_asset_selection(account_ids, provider),
+    }
+    response = call_api("core-api-post", API_APPLICATIONS, "Create application", debug_info, body)
+    return response.get("applicationId") if isinstance(response, dict) else None
+
+
+def update_application(app_id: str, metadata: dict, debug_info: list) -> None:
+    """Update the application's metadata (the API doesn't accept assetSelection)."""
+    call_api("core-api-put", API_APPLICATION.format(app_id=app_id), "Update application",
+             debug_info, metadata)
+
+
+def delete_application(app_id: str, debug_info: list) -> None:
+    """Delete the application."""
+    call_api("core-api-delete", API_APPLICATION.format(app_id=app_id), "Delete application",
+             debug_info)
+
+
+def apply_application(app_name: str, provider: str, account_ids: list, metadata: dict,
+                      existing: dict | None, recreate_on_change: bool, dry_run: bool,
+                      debug_info: list) -> dict:
+    """
+    Create, update or recreate one application and return its output entry.
+
+    Args:
+        app_name: Application name
+        provider: AWS/AZURE/GCP
+        account_ids: Accounts the application should select
+        metadata: Metadata fields from the arguments
+        existing: The existing application with this name, or None
+        recreate_on_change: Delete + recreate when the accounts changed
+        dry_run: Only compute the action, don't call the write APIs
+        debug_info: List that collects debug lines
+    """
+    warnings = []
+    added, removed = [], []
+    accounts_changed = False
+
+    if existing is None:
+        app_id = None
+        action = "created"
+    else:
+        app_id = existing.get("id")
+        if not app_id:
+            raise ValueError(f"Could not read the application ID. Available fields: {list(existing.keys())}")
+
+        current_accounts, current_provider = get_current_selection(existing)
+        if current_accounts is None:
+            accounts_changed = True
+            warnings.append("The existing application doesn't select assets by account, so its "
+                            "selection couldn't be compared with the tagged accounts.")
+        else:
+            added = [a for a in account_ids if a not in current_accounts]
+            removed = [a for a in current_accounts if a not in account_ids]
+            accounts_changed = bool(added or removed) or current_provider != provider
+
+        if accounts_changed and recreate_on_change:
+            action = "recreated"
+            warnings.append("The application was deleted and created again with the new accounts: "
+                            "it has a new ID.")
+            if existing.get("hasManualOverrides"):
+                warnings.append("It HAD MANUAL ASSET OVERRIDES (hasManualOverrides=true) - they were lost.")
+        else:
+            # Only metadata can be updated; with none provided there's nothing to send
+            action = "updated" if metadata else "unchanged"
+            if accounts_changed:
+                warnings.append("The account selection was NOT changed - the update API only accepts "
+                                "metadata. Run with recreate_on_change=true to apply the new accounts.")
+
+    if dry_run:
+        debug_info.append(f"[{app_name}] would send assetSelection: "
+                          f"{json.dumps(build_asset_selection(account_ids, provider))}")
+        app_id = app_id or "(new)"
+    elif action == "created":
+        app_id = create_application(app_name, metadata, account_ids, provider, debug_info)
+    elif action == "recreated":
+        delete_application(app_id, debug_info)
+        app_id = create_application(app_name, {**existing_metadata(existing), **metadata},
+                                    account_ids, provider, debug_info)
+    elif action == "updated":
+        update_application(app_id, metadata, debug_info)
+
+    return {
+        "application_id": app_id,
+        "application_name": app_name,
+        "provider": provider,
+        "action": f"would be {action}" if dry_run and action != "unchanged" else action,
+        "account_ids": account_ids,
+        "account_count": len(account_ids),
+        "accounts_changed": accounts_changed,
+        "accounts_added": added,
+        "accounts_removed": removed,
+        "status": "dry_run" if dry_run else ("warning" if warnings else "success"),
+        "message": " ".join(warnings),
+    }
+
+
+def apply_applications(groups: dict, names: dict, apps: dict, metadata: dict, recreate_on_change: bool,
+                       dry_run: bool, debug_info: list, results: list) -> None:
+    """
+    Run apply_application for every tag value and provider, appending to results.
+
+    results is filled in place, so the applications already handled are kept
+    when ScriptTimeout stops the loop. One application failing doesn't stop
+    the others: it gets a "failed" entry.
+    """
+    for tag_value, by_provider in groups.items():
+        for provider, account_ids in by_provider.items():
+            app_name = names[tag_value][provider]
+            check_timeout(f"application {app_name}")
+            try:
+                entry = apply_application(app_name, provider, account_ids, metadata, apps.get(app_name),
+                                          recreate_on_change, dry_run, debug_info)
+            except Exception as ex:  # noqa: BLE001 - one application must not block the others
+                demisto.error(traceback.format_exc())
+                entry = {
+                    "application_id": None, "application_name": app_name, "provider": provider,
+                    "action": "failed", "account_ids": account_ids, "account_count": len(account_ids),
+                    "accounts_changed": False, "accounts_added": [], "accounts_removed": [],
+                    "status": "failed", "message": str(ex),
+                }
+            results.append({"tag_value": tag_value, **entry})
+
+
+# =============================================================================
+# ASSET GROUPS (same commands as the CreateAssetGroup script)
+# =============================================================================
+
+def entries_data(entries: list) -> list:
+    """Collect the Contents (parsed if it is a JSON string) and EntryContext of every entry."""
+    data = []
+    for entry in entries:
+        contents = entry.get("Contents")
+        if isinstance(contents, str):
+            try:
+                contents = json.loads(contents)
+            except ValueError:
+                contents = None
+        if contents:
+            data.append(contents)
+        if entry.get("EntryContext"):
+            data.append(entry["EntryContext"])
+    return data
+
+
+def get_field(record: dict, keys: tuple):
+    """Return the first non-empty value among keys, matching keys case-insensitively."""
+    lowered = {str(k).lower(): v for k, v in record.items()}
+    for key in keys:
+        value = lowered.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def build_group_args(group_name: str, description: str, account_ids: list) -> dict:
+    """
+    Build the arguments shared by createAssetGroup and setAssetGroup.
+
+    The membership filter matches xdm.asset.realm - which equals the cloud
+    account ID for AWS, Azure and GCP - against every account (OR).
+    """
+    membership = {"AND": [{"OR": [
+        {"SEARCH_FIELD": "xdm.asset.realm", "SEARCH_TYPE": "WILDCARD", "SEARCH_VALUE": str(account_id)}
+        for account_id in account_ids
+    ]}]}
+    return {
+        "group_name": group_name,
+        "group_type": GROUP_TYPE,
+        "group_description": description,
+        "membership_json": json.dumps(membership),
+    }
+
+
+def get_existing_group_id(group_name: str, debug_info: list) -> str | None:
+    """
+    Return the ID of the asset group with this exact name, or None.
+
+    The name is matched exactly on the results, in case getAssetGroup's names
+    filter does partial matching.
+    """
+    entries = run_command(CMD_GET_GROUP, {"names": group_name}, debug_info)
+    for record in iter_records(entries_data(entries)):
+        if get_field(record, GROUP_NAME_KEYS) != group_name:
+            continue
+        group_id = get_field(record, GROUP_ID_KEYS)
+        if group_id is None:
+            raise ValueError(f"Found group '{group_name}' but could not extract its ID. "
+                             f"Available fields: {list(record.keys())}")
+        return str(group_id)
+    return None
+
+
+def create_asset_group(group_name: str, description: str, account_ids: list,
+                       debug_info: list) -> str | None:
+    """Create the dynamic asset group and return its ID (looked up by name if not returned)."""
+    entries = run_command(CMD_CREATE_GROUP, build_group_args(group_name, description, account_ids),
+                          debug_info)
+    for record in iter_records(entries_data(entries)):
+        group_id = get_field(record, CREATED_GROUP_ID_KEYS)
+        if group_id is not None:
+            return str(group_id)
+
+    log(debug_info, "Group ID not found in create result, looking it up by name")
+    return get_existing_group_id(group_name, debug_info)
+
+
+def update_asset_group(group_id: str, group_name: str, description: str, account_ids: list,
+                       debug_info: list) -> None:
+    """Update the asset group's name, description and membership."""
+    args = {"group_id": group_id, **build_group_args(group_name, description, account_ids)}
+    run_command(CMD_UPDATE_GROUP, args, debug_info)
+
+
+def apply_asset_group(group_name: str, account_ids: list, description: str, dry_run: bool,
+                      debug_info: list) -> dict:
+    """Create or update one asset group and return its output entry."""
+    group_id = get_existing_group_id(group_name, debug_info)
+    action = "updated" if group_id else "created"
+
+    if dry_run:
+        group_id = group_id or "(new)"
+    elif group_id:
+        update_asset_group(group_id, group_name, description, account_ids, debug_info)
+    else:
+        group_id = create_asset_group(group_name, description, account_ids, debug_info)
+
+    return {
+        "group_id": group_id,
+        "group_name": group_name,
+        "action": f"would be {action}" if dry_run else action,
+        "account_ids": account_ids,
+        "account_count": len(account_ids),
+        "status": "dry_run" if dry_run else "success",
+        "message": "",
+    }
+
+
+def apply_asset_groups(groups: dict, description: str, dry_run: bool, debug_info: list,
+                       results: list) -> None:
+    """
+    Run apply_asset_group for every tag value (accounts of all providers),
+    appending to results. Same failure and timeout handling as apply_applications.
+    """
+    for tag_value, by_provider in groups.items():
+        account_ids = unique([a for ids in by_provider.values() for a in ids])
+        check_timeout(f"asset group {tag_value}")
+        try:
+            entry = apply_asset_group(tag_value, account_ids, description, dry_run, debug_info)
+        except Exception as ex:  # noqa: BLE001 - one group must not block the others
+            demisto.error(traceback.format_exc())
+            entry = {
+                "group_id": None, "group_name": tag_value, "action": "failed",
+                "account_ids": account_ids, "account_count": len(account_ids),
+                "status": "failed", "message": str(ex),
+            }
+        results.append({"tag_value": tag_value, **entry})
+
+
+# =============================================================================
+# OUTPUT FORMATTING
+# =============================================================================
+
+def format_output(tag_key: str, lookup: dict, applications: list, asset_groups: list,
+                  notes: list, dry_run: bool) -> str:
+    """Format the human-readable output for War Room."""
+    text = "### 🔍 DRY RUN - No Changes Made\n\n" if dry_run else "### Applications and Asset Groups by Tag\n\n"
+    text += (f"**Tag Key:** `{tag_key}`\n"
+             f"**Accounts scanned:** {lookup['row_count']}\n"
+             f"**Tag values found:** {len(lookup['groups'])}\n\n")
+
+    if applications:
+        text += "#### Business Applications\n\n"
+        text += "| Tag Value | Application | Provider | Action | Accounts | Application ID |\n"
+        text += "|---|---|---|---|---|---|\n"
+        for r in applications:
+            text += (f"| {r['tag_value']} | {r['application_name']} | {r['provider']} | {r['action']} | "
+                     f"{r['account_count']} | `{r['application_id']}` |\n")
+
+        for r in applications:
+            # Diff against the existing application's selection (before this run)
+            details = []
+            if r["accounts_added"]:
+                details.append(f"requested, not in existing application: {', '.join(r['accounts_added'])}")
+            if r["accounts_removed"]:
+                details.append(f"in existing application, not requested: {', '.join(r['accounts_removed'])}")
+            if r["message"]:
+                details.append(r["message"])
+            if details:
+                text += f"\n**{r['application_name']}**\n" + "".join(f"- {d}\n" for d in details)
+
+    if asset_groups:
+        text += "\n#### Asset Groups\n\n"
+        text += "| Tag Value | Asset Group | Action | Accounts | Group ID |\n|---|---|---|---|---|\n"
+        for r in asset_groups:
+            text += (f"| {r['tag_value']} | {r['group_name']} | {r['action']} | "
+                     f"{r['account_count']} | `{r['group_id']}` |\n")
+        for r in asset_groups:
+            if r["message"]:
+                text += f"\n**{r['group_name']}**\n- {r['message']}\n"
+
+    for note in notes:
+        text += f"\n⚠️ {note}\n"
+    return text
+
+
+def format_footer(timings: dict, debug_info: list, show_debug: bool) -> str:
+    """Format the elapsed time of each part and, when requested, the debug info."""
+    text = "\n**Elapsed (s):** " + ", ".join(f"{k}: {v}" for k, v in timings.items()) + "\n"
+    if show_debug:
+        text += "\n\n### Debug Info\n\n```\n" + "\n".join(debug_info) + "\n```"
+    return text
+
+
+# =============================================================================
+# MAIN COMMAND
+# =============================================================================
+
+def main():
+    """
+    Main entry point for the script.
+
+    Finds the accounts carrying tag_key, groups them by tag value and, for
+    each value, creates/updates its application(s) (one per provider) and
+    then its asset group. One application or group failing doesn't stop the
+    others; the script only errors out if every one failed. When
+    SCRIPT_TIMEOUT_SECONDS is reached, it stops and reports what was done.
+    """
+    debug_info = []
+    try:
+        args = demisto.args()
+
+        # Parse and validate arguments
+        tag_key = (args.get("tag_key") or "").strip()
+        cloud_providers = unique(argToList(args.get("cloud_provider")))
+        case_sensitive = argToBoolean(args.get("case_sensitive", "false"))
+        recreate_on_change = argToBoolean(args.get("recreate_on_change") or "true")
+        dry_run = argToBoolean(args.get("dry_run", "false"))
+        debug_mode = argToBoolean(args.get("debug", "false"))
+        group_description = args.get("group_description") or DEFAULT_GROUP_DESCRIPTION
+
+        global CORE_API_INSTANCE, XQL_INSTANCE
+        CORE_API_INSTANCE = (args.get("core_api_instance") or "").strip() or None
+        XQL_INSTANCE = (args.get("xql_instance") or "").strip() or None
+
+        if not tag_key:
+            raise ValueError("tag_key is required")
+
+        providers = resolve_providers(cloud_providers)
+        metadata = build_metadata(args)
+        notes = []
+        timings = {}
+
+        # Find the accounts carrying tag_key, grouped by value and provider
+        started = time.time()
+        lookup = find_tagged_accounts(providers, tag_key, case_sensitive, debug_info)
+        timings["query"] = round(time.time() - started, 1)
+        groups = lookup["groups"]
+
+        if lookup["warning"]:
+            notes.append(lookup["warning"])
+        if lookup["empty_value_ids"]:
+            notes.append(f"Tag `{tag_key}` has an empty value in {len(lookup['empty_value_ids'])} "
+                         f"account(s) - they were ignored: {', '.join(lookup['empty_value_ids'])}")
+        if lookup["failed_ids"]:
+            notes.append(f"{len(lookup['failed_ids'])} account(s) could not be checked for the tag (their tags "
+                         f"could not be parsed) and were left out - run with debug=true to see which.")
+        for name, spellings in lookup["variants"].items():
+            notes.append(f"Values {', '.join(f'`{s}`' for s in spellings)} were merged into `{name}` "
+                         f"(case_sensitive=false).")
+        if not groups:
+            notes.append(f"No account has a non-empty `{tag_key}` tag - nothing was created or updated.")
+
+        names = {value: application_names(value, list(by_provider)) for value, by_provider in groups.items()}
+        applications = []
+        asset_groups = []
+
+        try:
+            if groups:
+                # List the applications once, then match them by name
+                started = time.time()
+                apps = list_applications(debug_info)
+                timings["list_applications"] = round(time.time() - started, 1)
+                log(debug_info, f"Applications found in the tenant: {len(apps)}")
+
+                # Applications left from a run that grouped a value's providers
+                # differently (e.g. "<value>" alone, now split per provider)
+                all_names = {n for by_provider in names.values() for n in by_provider.values()}
+                candidates = {c for value in groups
+                              for c in [value, *(APP_NAME_FORMAT.format(name=value, provider=p)
+                                                 for p in PROVIDERS.values())]}
+                stale = sorted(candidates & set(apps) - all_names)
+                if stale:
+                    notes.append(f"Existing application(s) not touched by this run: {', '.join(stale)} - "
+                                 f"review and delete them if they are no longer needed.")
+
+                started = time.time()
+                apply_applications(groups, names, apps, metadata, recreate_on_change, dry_run,
+                                   debug_info, applications)
+                timings["applications"] = round(time.time() - started, 1)
+
+                started = time.time()
+                apply_asset_groups(groups, group_description, dry_run, debug_info, asset_groups)
+                timings["asset_groups"] = round(time.time() - started, 1)
+        except ScriptTimeout as ex:
+            log(debug_info, str(ex))
+            notes.append(f"{ex}. Handled before stopping: {len(applications)} application(s), "
+                         f"{len(asset_groups)} asset group(s) - run the script again to finish.")
+
+        for command, instances in MULTI_INSTANCE_COMMANDS.items():
+            notes.append(f"`{command}` ran on {len(instances)} integration instances that all answered "
+                         f"({', '.join(instances)}); the first answer was used. Writes may have changed "
+                         f"several tenants - set core_api_instance / xql_instance to pin one instance.")
+
+        entries = applications + asset_groups
+        if entries and all(r["status"] == "failed" for r in entries):
+            raise DemistoException("; ".join(
+                f"{r.get('application_name') or r.get('group_name')}: {r['message']}" for r in entries
+            ))
+
+        readable = (format_output(tag_key, lookup, applications, asset_groups, notes, dry_run)
+                    + format_footer(timings, debug_info, debug_mode or dry_run))
+
+        return_results(CommandResults(
+            outputs_prefix="CreateApplication",
+            outputs_key_field="tag_key",
+            outputs={
+                "tag_key": tag_key,
+                "applications": applications,
+                "asset_groups": asset_groups,
+                "empty_value_accounts": lookup["empty_value_ids"],
+                "failed_lookups": lookup["failed_ids"],
+            },
+            readable_output=readable,
+        ))
+
+    except Exception as ex:
+        demisto.error(traceback.format_exc())
+        # Last debug lines, so the failure shows what the script was doing
+        trail = "\n".join(debug_info[-30:])
+        return_error(f"CreateApplication failed: {str(ex)}"
+                     + (f"\n\nLast debug lines:\n{trail}" if trail else ""))
+
+
+# =============================================================================
+# ENTRY POINT
+# =============================================================================
+
+if __name__ in ("__main__", "__builtin__", "builtins"):
+    main()
